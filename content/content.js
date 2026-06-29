@@ -1,0 +1,735 @@
+// EVChan Translator - Content Script
+// Handles DOM traversal, text extraction, translation, and restoration
+
+const HIGHLIGHT_CLASS = 'evchan-translated';
+const FAILED_CLASS = 'evchan-failed';
+const HIGHLIGHT_COLOR = '#fff59d';
+const HIGHLIGHT_DURATION = 3000; // ms
+const MESSAGE_RETRY_DELAY = 300; // ms to wait before retrying a message
+const BATCH_CHAR_LIMIT = 1_000; // target character count per batch
+const MAX_BATCH_ITEMS = 20; // safety cap on items per batch
+
+// Track state
+let isTranslating = false;
+let shouldCancel = false;
+
+/**
+ * Send a message to the background with one retry on null response or exception.
+ * MV3 service workers can be terminated when idle, causing sendMessage
+ * to return null or throw. This mirrors the retry pattern in the background script.
+ */
+async function sendMessageWithRetry(message) {
+  try {
+    const response = await chrome.runtime.sendMessage(message);
+    if (response !== null) {
+      return response;
+    }
+  } catch {
+    // Service worker may be terminated; will retry below.
+  }
+
+  // Service worker may be cold-starting; wait and retry once.
+  await new Promise((r) => setTimeout(r, MESSAGE_RETRY_DELAY));
+  return chrome.runtime.sendMessage(message);
+}
+
+/** @returns {{ isTranslating: boolean, shouldCancel: boolean }} */
+function getTranslationState() {
+  return { isTranslating, shouldCancel };
+}
+
+/** @param {boolean} val */
+function setShouldCancel(val) {
+  shouldCancel = val;
+}
+
+/**
+ * Get page context for translation prompts.
+ * Returns page title trimmed, falling back to URL if title is empty.
+ * @returns {{ pageTitle: string }}
+ */
+function getPageContext() {
+  const title = document.title?.trim();
+  const pageTitle = title || document.location.href;
+  return { pageTitle };
+}
+
+/**
+ * Detect the page language from HTML metadata.
+ * Checks `<html lang="XX">` first, then falls back to meta tags.
+ * Returns the primary language subtag (e.g., "en" from "en-US") or undefined.
+ * @returns {string | undefined}
+ */
+function detectPageLanguage() {
+  // Check <html lang="XX">
+  const htmlLang = document.documentElement.lang;
+  if (htmlLang) {
+    return htmlLang.split('-')[0].toLowerCase();
+  }
+
+  // Check <meta http-equiv="content-language" content="XX">
+  const contentLangMeta = document.querySelector('meta[http-equiv="content-language"]');
+  if (contentLangMeta && contentLangMeta.content) {
+    return contentLangMeta.content.split(',')[0].split('-')[0].toLowerCase().trim();
+  }
+
+  // Check <meta name="language" content="XX">
+  const languageMeta = document.querySelector('meta[name="language"]');
+  if (languageMeta && languageMeta.content) {
+    return languageMeta.content.split('-')[0].toLowerCase().trim();
+  }
+
+  return undefined;
+}
+
+/**
+ * Check if an element is visible and should be translated.
+ */
+function isVisible(element) {
+  const style = window.getComputedStyle(element);
+  return (
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    style.opacity !== '0' &&
+    element.offsetWidth > 0 &&
+    element.offsetHeight > 0
+  );
+}
+
+/**
+ * Check if an element should be skipped (e.g., scripts, styles, inputs).
+ */
+function shouldSkipElement(element) {
+  const tag = element.tagName.toLowerCase();
+  const skipTags = ['script', 'style', 'textarea', 'input', 'select', 'button', 'noscript', 'code'];
+  return skipTags.includes(tag) || !!element.closest(skipTags.join(','));
+}
+
+/**
+ * Check if an element has direct text node children with non-empty content.
+ * This excludes pure container elements that only inherit text from descendants.
+ * TEXT_NODE nodeType is 3.
+ */
+function hasDirectText(element) {
+  for (let i = 0; i < element.childNodes.length; i++) {
+    const child = element.childNodes[i];
+    if (child.nodeType === 3 && child.textContent.trim().length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Get only the direct text of an element (text node children),
+ * excluding text inside child elements like <script>.
+ * This avoids polluting translation with script code.
+ */
+function getDirectText(element) {
+  let text = '';
+  for (let i = 0; i < element.childNodes.length; i++) {
+    const child = element.childNodes[i];
+    if (child.nodeType === 3) {
+      text += child.textContent;
+    }
+  }
+  return text;
+}
+
+/**
+ * Check if an element has any child elements.
+ * If so, replacing the parent's textContent would destroy these children.
+ */
+function hasStructuralChildren(element) {
+  return element.children.length > 0;
+}
+
+/**
+ * Extract all translatable text nodes from the DOM.
+ * Only accepts leaf elements that have direct text content,
+ * avoiding parent containers whose textContent replacement would destroy child structure.
+ * Structural children of accepted elements are skipped — the parent handles them
+ * via HTML-based translation to preserve context for correct word ordering.
+ * Returns an array of { element, text, originalText } objects.
+ */
+function extractTextNodes() {
+  const nodes = [];
+  // Track elements that were accepted and have direct text.
+  // Their structural children will be skipped since the parent handles them.
+  const processedWithDirectText = new Set();
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
+    acceptNode: (node) => {
+      // Skip non-content elements (scripts, styles, inputs, etc.)
+      if (shouldSkipElement(node)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      const style = window.getComputedStyle(node);
+
+      // display: contents elements have no box of their own; skip the element
+      // but still walk its descendants (FILTER_SKIP instead of FILTER_REJECT)
+      if (style.display === 'contents') {
+        return NodeFilter.FILTER_SKIP;
+      }
+
+      // Skip hidden elements
+      if (!isVisible(node)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      // Skip elements with no text content
+      if (node.textContent.trim().length === 0) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      // Only accept elements with direct text nodes.
+      // Pure containers (like <div><h1>...</h1></div>) inherit text from descendants
+      // but replacing their textContent would destroy nested HTML structure.
+      if (!hasDirectText(node)) {
+        return NodeFilter.FILTER_SKIP;
+      }
+
+      // Skip if an ancestor was already accepted with direct text and has children.
+      // That ancestor will handle all descendants via HTML-based translation,
+      // which provides full context for correct word ordering.
+      let parent = node.parentElement;
+      while (parent) {
+        if (processedWithDirectText.has(parent) && parent.children.length > 0) {
+          return NodeFilter.FILTER_SKIP;
+        }
+        parent = parent.parentElement;
+      }
+
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  let node = walker.nextNode();
+  while (node) {
+    // Track elements with direct text for child-skipping logic
+    if (hasDirectText(node)) {
+      processedWithDirectText.add(node);
+    }
+
+    // Only extract direct text (excludes <script> content and descendant text).
+    // node.textContent would include script contents, polluting the translation.
+    const text = getDirectText(node);
+    if (text.trim().length > 0) {
+      if (!node.hasAttribute('data-original-text') && !node.hasAttribute('data-original-html')) {
+        // For elements with structural children, save innerHTML so restore
+        // can reconstruct the full DOM (preserving <script>, <a>, etc.).
+        // For simple elements, saving textContent of direct text nodes is enough.
+        if (hasStructuralChildren(node)) {
+          node.setAttribute('data-original-html', node.innerHTML);
+        } else {
+          node.setAttribute('data-original-text', text);
+        }
+      }
+      nodes.push({ element: node, text });
+    }
+    node = walker.nextNode();
+  }
+
+  return nodes;
+}
+
+/**
+ * Pre-group extracted nodes into translation batches.
+ * Plain text elements are grouped by character limit (~1,000) and item cap (20).
+ * Elements with structural children are separated for individual HTML-based translation.
+ * @param {Array<{element: Element, text: string}>} nodes
+ * @returns {{
+ *   plainBatches: Array<Array<{element: Element, text: string}>>,
+ *   structuralElements: Array<{element: Element, text: string}>
+ * }}
+ */
+function groupNodesIntoBatches(nodes) {
+  const plainBatches = [];
+  const structuralElements = [];
+
+  let currentBatch = [];
+  let currentChars = 0;
+
+  for (const node of nodes) {
+    if (hasStructuralChildren(node.element)) {
+      structuralElements.push(node);
+      continue;
+    }
+
+    currentBatch.push(node);
+    currentChars += node.text.length;
+
+    if (currentChars >= BATCH_CHAR_LIMIT || currentBatch.length >= MAX_BATCH_ITEMS) {
+      plainBatches.push(currentBatch);
+      currentBatch = [];
+      currentChars = 0;
+    }
+  }
+
+  if (currentBatch.length > 0) {
+    plainBatches.push(currentBatch);
+  }
+
+  return { plainBatches, structuralElements };
+}
+
+/**
+ * Apply highlight class to an element.
+ */
+function highlightElement(element) {
+  element.classList.add(HIGHLIGHT_CLASS);
+  element.style.backgroundColor = HIGHLIGHT_COLOR;
+}
+
+/**
+ * Remove highlight class from an element.
+ */
+function unhighlightElement(element) {
+  element.classList.remove(HIGHLIGHT_CLASS);
+  element.style.backgroundColor = '';
+}
+
+/**
+ * Mark an element as failed.
+ */
+function markFailed(element) {
+  element.classList.add(FAILED_CLASS);
+  element.style.backgroundColor = '#ffcdd2'; // Light red
+}
+
+/**
+ * Send progress update to background script.
+ */
+function sendProgress(current, total, status) {
+  const percentage = total > 0 ? Math.round((current / total) * 100) : 0;
+  chrome.runtime.sendMessage(
+    {
+      type: 'PROGRESS',
+      progress: { current, total, percentage, status },
+    },
+    () => {} // Ignore response
+  );
+}
+
+/**
+ * Translate a single text segment.
+ */
+async function translateSegment(text, settings, sourceLang) {
+  const { pageTitle } = getPageContext();
+  const response = await sendMessageWithRetry({
+    type: 'TRANSLATE_CHUNK',
+    text,
+    settings,
+    sourceLang,
+    pageTitle,
+  });
+
+  if (!response) {
+    throw new Error('Background service unavailable');
+  }
+
+  if (!response.success) {
+    throw new Error(response.error || 'Translation failed');
+  }
+
+  return response.translated;
+}
+
+/**
+ * Translate multiple text segments in one API call.
+ * @param {string[]} texts - Array of texts to translate
+ * @param {object} settings - API settings
+ * @param {string | undefined} sourceLang - Source language
+ * @returns {Promise<string[]>} Array of translated texts
+ */
+async function translateBatch(texts, settings, sourceLang) {
+  const { pageTitle } = getPageContext();
+  const response = await sendMessageWithRetry({
+    type: 'TRANSLATE_CHUNK_BATCH',
+    texts,
+    settings,
+    sourceLang,
+    pageTitle,
+  });
+
+  if (!response) {
+    throw new Error('Background service unavailable');
+  }
+
+  if (!response.success) {
+    throw new Error(response.error || 'Batch translation failed');
+  }
+
+  return response.translated;
+}
+
+/**
+ * Translate the element's innerHTML as a whole, preserving HTML structure.
+ * Sends full HTML to the LLM so it can produce natural word ordering
+ * while keeping all tags and attributes intact.
+ */
+async function translateMixedContent(element, settings, sourceLang) {
+  const html = element.innerHTML;
+  const { pageTitle } = getPageContext();
+  const response = await sendMessageWithRetry({
+    type: 'TRANSLATE_HTML',
+    html,
+    settings,
+    sourceLang,
+    pageTitle,
+  });
+
+  if (!response) {
+    throw new Error('Background service unavailable');
+  }
+
+  if (!response.success) {
+    throw new Error(response.error || 'HTML translation failed');
+  }
+
+  element.innerHTML = response.translated;
+}
+
+/**
+ * Process translation for a single element.
+ * For elements with structural children (like <a>, <code>), translates
+ * each text segment individually to preserve DOM structure.
+ * @returns {string | undefined} The translated text (for simple elements) or undefined (for mixed content)
+ */
+async function translateElement(element, originalText, settings, sourceLang) {
+  let translated;
+
+  if (hasStructuralChildren(element)) {
+    // Element has structural children - translate text segments individually
+    await translateMixedContent(element, settings, sourceLang);
+  } else {
+    // Simple element - translate the full text
+    translated = await translateSegment(originalText, settings, sourceLang);
+    element.textContent = translated;
+  }
+
+  // Highlight the element
+  highlightElement(element);
+
+  return translated;
+}
+
+/**
+ * Process a single translation batch: send batch request, apply results,
+ * retry null entries individually.
+ * @returns {{ cancelled: boolean }} Whether processing was cancelled.
+ */
+async function processBatch(batch, texts, settings, sourceLang, results) {
+  try {
+    const translations = await translateBatch(texts, settings, sourceLang);
+
+    // Apply successful translations
+    for (let i = 0; i < batch.length; i++) {
+      if (translations[i] !== null) {
+        batch[i].element.textContent = translations[i];
+        highlightElement(batch[i].element);
+        results.translated.push(batch[i].element);
+      }
+    }
+
+    // Retry null entries individually
+    for (let i = 0; i < batch.length; i++) {
+      if (shouldCancel) {
+        return { cancelled: true };
+      }
+      if (translations[i] === null) {
+        try {
+          const translated = await translateSegment(texts[i], settings, sourceLang);
+          batch[i].element.textContent = translated;
+          highlightElement(batch[i].element);
+          results.translated.push(batch[i].element);
+        } catch (error) {
+          console.error('Individual retry failed:', error);
+          markFailed(batch[i].element);
+          results.failed.push(batch[i].element);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Batch translation failed, retrying individually:', error);
+    // Full batch failure — retry each item individually
+    for (const item of batch) {
+      if (shouldCancel) {
+        return { cancelled: true };
+      }
+      try {
+        const translated = await translateSegment(item.text, settings, sourceLang);
+        item.element.textContent = translated;
+        highlightElement(item.element);
+        results.translated.push(item.element);
+      } catch (error) {
+        console.error('Individual retry failed:', error);
+        markFailed(item.element);
+        results.failed.push(item.element);
+      }
+    }
+  }
+
+  return { cancelled: false };
+}
+
+/**
+ * Worker: process plain text batches sequentially.
+ * @param {Array<Array<{element, text}>>} plainBatches
+ * @param {object} settings
+ * @param {string | undefined} sourceLang
+ * @param {string} langLabel
+ * @param {number} total
+ * @param {{translated: Element[], failed: Element[], progress: number}} shared
+ */
+async function processPlainBatches(plainBatches, settings, sourceLang, langLabel, total, shared) {
+  for (const batch of plainBatches) {
+    if (shouldCancel) {
+      return { cancelled: true };
+    }
+
+    const texts = batch.map((item) => item.text);
+    const batchResult = await processBatch(batch, texts, settings, sourceLang, shared);
+    if (batchResult.cancelled) {
+      return { cancelled: true };
+    }
+
+    shared.progress += batch.length;
+    sendProgress(shared.progress, total, `Translating ${langLabel}... ${shared.progress}/${total}`);
+  }
+
+  return { cancelled: false };
+}
+
+/**
+ * Worker: process structural (HTML) elements sequentially.
+ * @param {Array<{element, text}>} structuralElements
+ * @param {object} settings
+ * @param {string | undefined} sourceLang
+ * @param {string} langLabel
+ * @param {number} total
+ * @param {{translated: Element[], failed: Element[], progress: number}} shared
+ */
+async function processStructuralElements(
+  structuralElements,
+  settings,
+  sourceLang,
+  langLabel,
+  total,
+  shared
+) {
+  for (const node of structuralElements) {
+    if (shouldCancel) {
+      return { cancelled: true };
+    }
+
+    try {
+      await translateMixedContent(node.element, settings, sourceLang);
+      highlightElement(node.element);
+      shared.translated.push(node.element);
+      shared.progress++;
+      sendProgress(
+        shared.progress,
+        total,
+        `Translating ${langLabel}... ${shared.progress}/${total}`
+      );
+    } catch (error) {
+      console.error('Translation failed for element:', error);
+      markFailed(node.element);
+      shared.failed.push(node.element);
+      shared.progress++;
+      sendProgress(shared.progress, total, `Error: ${shared.failed.length} failed`);
+    }
+  }
+
+  return { cancelled: false };
+}
+
+/**
+ * Clear all stale translation artifacts from the DOM.
+ * Ensures a fresh start for the next translation by removing
+ * leftover attributes, classes, and styles from previous runs.
+ */
+function clearStaleTranslationState() {
+  // Remove all data-original-* attributes so extractTextNodes reads fresh DOM.
+  document.querySelectorAll('[data-original-text]').forEach((el) => {
+    el.removeAttribute('data-original-text');
+  });
+  document.querySelectorAll('[data-original-html]').forEach((el) => {
+    el.removeAttribute('data-original-html');
+  });
+
+  // Clean up leftover highlight/failed classes and inline styles.
+  document.querySelectorAll(`.${HIGHLIGHT_CLASS}, .${FAILED_CLASS}`).forEach((el) => {
+    el.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
+    el.style.backgroundColor = '';
+  });
+}
+
+/**
+ * Main translation function. Two-phase: collect nodes, then translate concurrently.
+ * Runs plain batch translation and HTML translation in parallel (concurrency level 2).
+ */
+async function translatePage(settings) {
+  if (isTranslating) {
+    return { success: false, error: 'Translation already in progress' };
+  }
+
+  isTranslating = true;
+  shouldCancel = false;
+
+  try {
+    // Clear stale state from any previous translation (cancelled or completed).
+    // This ensures extractTextNodes reads current DOM, not leftover attributes.
+    clearStaleTranslationState();
+
+    // --- Phase 1: Collect ---
+    const nodes = extractTextNodes();
+    const total = nodes.length;
+
+    if (total === 0) {
+      return { success: false, error: 'No translatable text found' };
+    }
+
+    sendProgress(0, total, 'Collecting elements...');
+
+    const { plainBatches, structuralElements } = groupNodesIntoBatches(nodes);
+
+    // Detect source language from HTML metadata
+    const sourceLang = detectPageLanguage();
+    const langLabel = sourceLang ? `from ${sourceLang}` : 'auto-detect';
+
+    // --- Phase 2: Translate & Display (concurrent) ---
+    // Shared state for both workers (safe in single-threaded JS with async/await)
+    const shared = {
+      translated: [],
+      failed: [],
+      progress: 0,
+    };
+
+    // Run both workers concurrently
+    const [batchResult, htmlResult] = await Promise.all([
+      processPlainBatches(plainBatches, settings, sourceLang, langLabel, total, shared),
+      processStructuralElements(structuralElements, settings, sourceLang, langLabel, total, shared),
+    ]);
+
+    // Check if either worker was cancelled
+    if (batchResult.cancelled || htmlResult.cancelled || shouldCancel) {
+      return { success: false, error: 'Translation cancelled' };
+    }
+
+    // Cleanup highlights (after delay)
+    setTimeout(() => {
+      shared.translated.forEach((el) => unhighlightElement(el));
+      shared.failed.forEach((el) => el.classList.remove(FAILED_CLASS));
+    }, HIGHLIGHT_DURATION);
+
+    sendProgress(total, total, 'Translation complete');
+
+    return {
+      success: true,
+      translatedCount: shared.translated.length,
+      failedCount: shared.failed.length,
+    };
+  } finally {
+    isTranslating = false;
+  }
+}
+
+/**
+ * Restore all original text content.
+ */
+function restoreOriginals() {
+  // Elements with structural children saved innerHTML for full DOM restoration.
+  const htmlElements = document.querySelectorAll('[data-original-html]');
+  htmlElements.forEach((element) => {
+    element.innerHTML = element.getAttribute('data-original-html');
+    element.removeAttribute('data-original-html');
+    element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
+    element.style.backgroundColor = '';
+  });
+
+  // Simple elements only saved their direct text.
+  const textElements = document.querySelectorAll('[data-original-text]');
+  textElements.forEach((element) => {
+    element.textContent = element.getAttribute('data-original-text');
+    element.removeAttribute('data-original-text');
+    element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
+    element.style.backgroundColor = '';
+  });
+
+  return { success: true, restoredCount: htmlElements.length + textElements.length };
+}
+
+// Listen for messages from background script
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) {
+    return false;
+  }
+  (async () => {
+    try {
+      switch (message.type) {
+        case 'TRANSLATE_REQUEST': {
+          const result = await translatePage(message.settings);
+          sendResponse(result);
+          break;
+        }
+
+        case 'RESTORE_REQUEST': {
+          const result = restoreOriginals();
+          sendResponse(result);
+          break;
+        }
+
+        case 'CANCEL_TRANSLATION': {
+          shouldCancel = true;
+          // Tell background to abort any in-flight API calls
+          chrome.runtime.sendMessage({ type: 'ABORT_TRANSLATION' }).catch(() => {});
+          sendResponse({ success: true });
+          break;
+        }
+
+        default:
+          sendResponse({ success: false, error: 'Unknown message type' });
+      }
+    } catch (error) {
+      console.error('[content] error handling message:', error);
+      sendResponse({ success: false, error: error.message });
+    }
+  })();
+
+  return true; // Async response
+});
+
+// Expose functions on window for testing
+if (typeof window !== 'undefined' && window.__EVCHAN_DEBUG__) {
+  window.__evchan_content__ = {
+    getTranslationState,
+    setShouldCancel,
+    getPageContext,
+    detectPageLanguage,
+    isVisible,
+    shouldSkipElement,
+    hasDirectText,
+    getDirectText,
+    hasStructuralChildren,
+    translateMixedContent,
+    translateBatch,
+    extractTextNodes,
+    groupNodesIntoBatches,
+    highlightElement,
+    unhighlightElement,
+    markFailed,
+    sendProgress,
+    sendMessageWithRetry,
+    translateElement,
+    translatePage,
+    restoreOriginals,
+    clearStaleTranslationState,
+  };
+}
+
+// Signal background that content script is loaded on this page.
+// This clears any stale translation state from previous pages.
+chrome.runtime.sendMessage({ type: 'CONTENT_LOADED' }).catch(() => {});

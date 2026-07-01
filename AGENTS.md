@@ -38,7 +38,6 @@ EVChan-Translator/
 
 ## Coding
 
-- **Load `fp-idiomatic-style` skill** before implementing code.
 - **Vanilla JavaScript** — No frameworks, no build step.
 - **ES modules** — Use `type="module"` where applicable.
 
@@ -51,3 +50,10 @@ EVChan-Translator/
 
 - **MV3 compliant.** No API key required for the LLM endpoint.
 - Use `chrome.storage.local` for settings.
+
+## Code Review
+
+When code review is requested, perform both review tracks. Spawn a subagent when available; otherwise, use the current agent context.
+
+1. **General Code Review** — Use the `general` subagent to review changes for correctness, style, test coverage, and overall quality. The reviewer decides: accept / request-change / deny.
+2. **Security Code Review** — Use the `security-reviewer` subagent to audit for OWASP vulnerabilities, injection risks, data leakage, and compliance issues.

@@ -27,9 +27,11 @@ export default [
         AbortSignal: 'readonly',
         NodeFilter: 'readonly',
         MutationObserver: 'readonly',
+        DOMParser: 'readonly',
         // Built-in types
         Map: 'readonly',
         Set: 'readonly',
+        WeakMap: 'readonly',
         Promise: 'readonly',
         Error: 'readonly',
         JSON: 'readonly',
@@ -52,6 +54,8 @@ export default [
         Blob: 'readonly',
         File: 'readonly',
         FileReader: 'readonly',
+        // Compile-time constants (defined by esbuild/vitest)
+        __EVCHAN_DEBUG__: 'writable',
       },
     },
     rules: {

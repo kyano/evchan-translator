@@ -13,10 +13,12 @@ function createChromeStub() {
       local: {
         get: vi.fn(() => Promise.resolve({})),
         set: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(() => Promise.resolve()),
       },
     },
     tabs: {
       sendMessage: vi.fn(() => Promise.resolve({ success: true, translatedCount: 5 })),
+      onRemoved: { addListener: vi.fn() },
     },
   };
 }
@@ -25,6 +27,7 @@ describe('Background Script', () => {
   let chromeStub;
   let originalFetch;
   let messageHandler;
+  let onRemovedHandler;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -41,6 +44,12 @@ describe('Background Script', () => {
       messageHandler = fn;
     });
 
+    // Capture the tab removal listener callback
+    onRemovedHandler = null;
+    chromeStub.tabs.onRemoved.addListener.mockImplementation((fn) => {
+      onRemovedHandler = fn;
+    });
+
     // Import the real module — triggers onMessage.addListener registration
     await import('../background/background.js');
   });
@@ -49,6 +58,7 @@ describe('Background Script', () => {
     global.fetch = originalFetch;
     global.chrome = undefined;
     messageHandler = null;
+    onRemovedHandler = null;
   });
 
   /**
@@ -649,6 +659,65 @@ describe('Background Script', () => {
           call[0]['_translationState-99'].state === 'ready'
       );
       expect(tab99ReadyCalls.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('tab removal cleanup', () => {
+    it('aborts and removes AbortController when tab is closed', async () => {
+      // Start translation to create an AbortController
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ success: true, translatedCount: 10 });
+      await sendMessage(
+        {
+          type: 'TRANSLATE',
+          tabId: 42,
+          settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        },
+        {}
+      );
+
+      // Simulate tab being closed
+      onRemovedHandler(42);
+
+      // After cleanup, a new TRANSLATE for the same tabId should create a fresh controller
+      // (not find a stale one). Verify by starting a new translation and checking it works.
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ success: true, translatedCount: 5 });
+      const response = await sendMessage(
+        {
+          type: 'TRANSLATE',
+          tabId: 42,
+          settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        },
+        {}
+      );
+
+      expect(response).toEqual({ success: true, translatedCount: 5 });
+    });
+
+    it('removes per-tab storage state when tab is closed', async () => {
+      // Start translation to create state
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ success: true, translatedCount: 10 });
+      await sendMessage(
+        {
+          type: 'TRANSLATE',
+          tabId: 42,
+          settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        },
+        {}
+      );
+
+      // Simulate tab being closed
+      onRemovedHandler(42);
+
+      // Verify storage.remove was called with the per-tab state key
+      expect(chromeStub.storage.local.remove).toHaveBeenCalledWith('_translationState-42');
+    });
+
+    it('does nothing when removed tab has no controller', async () => {
+      // Simulate tab being closed without any translation
+      onRemovedHandler(99);
+
+      // Should not throw errors
+      expect(chromeStub.storage.local.remove).toHaveBeenCalledWith('_translationState-99');
     });
   });
 

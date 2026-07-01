@@ -14,6 +14,19 @@ const DEFAULT_SETTINGS = {
 const abortControllers = new Map();
 
 /**
+ * Clean up per-tab resources when a tab is closed.
+ * Prevents memory leaks from stale AbortControllers and unbounded storage keys.
+ */
+function cleanupTab(tabId) {
+  abortControllers.get(tabId)?.abort();
+  abortControllers.delete(tabId);
+  chrome.storage.local.remove(`_translationState-${tabId}`).catch(() => {});
+}
+
+// Listen for tab removal to prevent memory leaks
+chrome.tabs.onRemoved.addListener(cleanupTab);
+
+/**
  * Load settings from storage, applying defaults for missing values.
  */
 async function loadSettings() {

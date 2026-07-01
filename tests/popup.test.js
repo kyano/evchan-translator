@@ -335,12 +335,31 @@ describe('Popup', () => {
   });
 
   describe('no active tab', () => {
-    beforeEach(() => {
-      chromeStub.tabs.query.mockResolvedValueOnce([]);
-    });
+    async function loadPopupWithNoTab() {
+      vi.resetModules();
+
+      const noTabStub = createChromeStub();
+      noTabStub.tabs.query.mockResolvedValue([]);
+      global.chrome = noTabStub;
+
+      document.body.innerHTML = popupHTML;
+      await import('../popup/popup.js');
+      await flush();
+    }
 
     it('shows error for translate action', async () => {
-      await setupFormForTranslation();
+      await loadPopupWithNoTab();
+
+      // Set up form fields
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+      setField('api-endpoint', 'http://test.com/v1');
+      await flush(50);
+      setField('model', 'gpt-4o');
+      setField('target-language', 'Japanese');
+      await flush(50);
 
       document.getElementById('translate-btn').click();
       await flush(50);
@@ -350,6 +369,8 @@ describe('Popup', () => {
     });
 
     it('shows error for restore action', async () => {
+      await loadPopupWithNoTab();
+
       document.getElementById('restore-btn').click();
       await flush(50);
 
@@ -358,6 +379,8 @@ describe('Popup', () => {
     });
 
     it('shows error for cancel action', async () => {
+      await loadPopupWithNoTab();
+
       document.getElementById('cancel-btn').click();
       await flush(50);
 
@@ -412,6 +435,83 @@ describe('Popup', () => {
 
       expect(document.getElementById('api-endpoint').value).toBe('http://localhost:11434/v1');
       expect(document.getElementById('target-language').value).toBe('Spanish');
+    });
+  });
+
+  describe('endpoint validation', () => {
+    it('rejects empty endpoint', async () => {
+      setField('api-endpoint', '   ');
+      await flush(50);
+
+      // Should not have called fetch since endpoint is invalid
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid URL format', async () => {
+      setField('api-endpoint', 'not-a-url');
+      await flush(50);
+
+      // Should not have called fetch since endpoint is invalid
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects javascript: protocol', async () => {
+      setField('api-endpoint', 'javascript:alert(1)');
+      await flush(50);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects data: protocol', async () => {
+      setField('api-endpoint', 'data:text/html,<h1>test</h1>');
+      await flush(50);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('accepts valid http URL', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      setField('api-endpoint', 'http://localhost:11434');
+      await flush(50);
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://localhost:11434/v1/models',
+        expect.any(Object)
+      );
+    });
+
+    it('accepts valid https URL', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      setField('api-endpoint', 'https://api.openai.com/v1');
+      await flush(50);
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://api.openai.com/v1/v1/models',
+        expect.any(Object)
+      );
+    });
+
+    it('accepts valid http URL with path', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      setField('api-endpoint', 'http://192.168.1.1:8080/v1');
+      await flush(50);
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://192.168.1.1:8080/v1/v1/models',
+        expect.any(Object)
+      );
     });
   });
 

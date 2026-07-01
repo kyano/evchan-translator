@@ -5,4 +5,7 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
   },
+  define: {
+    __EVCHAN_DEBUG__: 'true',
+  },
 });

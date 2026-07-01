@@ -14,6 +14,14 @@ let isTranslating = false;
 let shouldCancel = false;
 
 /**
+ * Store original HTML content for elements with structural children.
+ * Uses Map to avoid storing HTML as data attributes (prevents tampering).
+ * Cleared on each translation cycle (clearStaleTranslationState, restoreOriginals).
+ * @type {Map<Element, {type: string, value: string}>}
+ */
+const originalContentMap = new Map();
+
+/**
  * Send a message to the background with one retry on null response or exception.
  * MV3 service workers can be terminated when idle, causing sendMessage
  * to return null or throw. This mirrors the retry pattern in the background script.
@@ -84,13 +92,16 @@ function detectPageLanguage() {
 
 /**
  * Check if an element is visible and should be translated.
+ * @param {Element} element - Element to check
+ * @param {CSSStyleDeclaration} [style] - Pre-computed computed style (optional; avoids re-query)
+ * @returns {boolean}
  */
-function isVisible(element) {
-  const style = window.getComputedStyle(element);
+function isVisible(element, style) {
+  const computedStyle = style || window.getComputedStyle(element);
   return (
-    style.display !== 'none' &&
-    style.visibility !== 'hidden' &&
-    style.opacity !== '0' &&
+    computedStyle.display !== 'none' &&
+    computedStyle.visibility !== 'hidden' &&
+    computedStyle.opacity !== '0' &&
     element.offsetWidth > 0 &&
     element.offsetHeight > 0
   );
@@ -173,8 +184,8 @@ function extractTextNodes() {
         return NodeFilter.FILTER_SKIP;
       }
 
-      // Skip hidden elements
-      if (!isVisible(node)) {
+      // Skip hidden elements (pass cached style to avoid re-query)
+      if (!isVisible(node, style)) {
         return NodeFilter.FILTER_REJECT;
       }
 
@@ -216,12 +227,16 @@ function extractTextNodes() {
     // node.textContent would include script contents, polluting the translation.
     const text = getDirectText(node);
     if (text.trim().length > 0) {
-      if (!node.hasAttribute('data-original-text') && !node.hasAttribute('data-original-html')) {
-        // For elements with structural children, save innerHTML so restore
-        // can reconstruct the full DOM (preserving <script>, <a>, etc.).
+      // Skip if already processed (has saved original content)
+      const hasSavedHtml = originalContentMap.has(node);
+      const hasSavedText = node.hasAttribute('data-original-text');
+      if (!hasSavedHtml && !hasSavedText) {
+        // For elements with structural children, save innerHTML in WeakMap
+        // so restore can reconstruct the full DOM (preserving <script>, <a>, etc.).
+        // Stored in JS memory to prevent attribute tampering.
         // For simple elements, saving textContent of direct text nodes is enough.
         if (hasStructuralChildren(node)) {
-          node.setAttribute('data-original-html', node.innerHTML);
+          originalContentMap.set(node, { type: 'html', value: node.innerHTML });
         } else {
           node.setAttribute('data-original-text', text);
         }
@@ -365,6 +380,35 @@ async function translateBatch(texts, settings, sourceLang) {
 }
 
 /**
+ * Sanitize HTML string by removing dangerous elements and attributes.
+ * Prevents XSS from untrusted LLM output before DOM injection.
+ * @param {string} html - Raw HTML string from LLM
+ * @returns {string} Sanitized HTML string
+ */
+function sanitizeHtml(html) {
+  if (!html) return '';
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Remove dangerous elements
+  const dangerousTags = ['script', 'iframe', 'object', 'embed', 'link', 'meta', 'base'];
+  doc.querySelectorAll(dangerousTags.join(',')).forEach((el) => el.remove());
+
+  // Strip event handler attributes (on*) from all elements
+  doc.querySelectorAll('*').forEach((el) => {
+    const attrs = [...el.attributes];
+    attrs.forEach((attr) => {
+      if (/^on/i.test(attr.name)) {
+        el.removeAttribute(attr.name);
+      }
+    });
+  });
+
+  return doc.body.innerHTML;
+}
+
+/**
  * Translate the element's innerHTML as a whole, preserving HTML structure.
  * Sends full HTML to the LLM so it can produce natural word ordering
  * while keeping all tags and attributes intact.
@@ -388,7 +432,7 @@ async function translateMixedContent(element, settings, sourceLang) {
     throw new Error(response.error || 'HTML translation failed');
   }
 
-  element.innerHTML = response.translated;
+  element.innerHTML = sanitizeHtml(response.translated);
 }
 
 /**
@@ -552,12 +596,12 @@ async function processStructuralElements(
  * leftover attributes, classes, and styles from previous runs.
  */
 function clearStaleTranslationState() {
-  // Remove all data-original-* attributes so extractTextNodes reads fresh DOM.
+  // Clear saved original content from WeakMap (structural elements).
+  originalContentMap.clear();
+
+  // Remove data-original-text attributes (simple elements).
   document.querySelectorAll('[data-original-text]').forEach((el) => {
     el.removeAttribute('data-original-text');
-  });
-  document.querySelectorAll('[data-original-html]').forEach((el) => {
-    el.removeAttribute('data-original-html');
   });
 
   // Clean up leftover highlight/failed classes and inline styles.
@@ -641,13 +685,28 @@ async function translatePage(settings) {
  * Restore all original text content.
  */
 function restoreOriginals() {
-  // Elements with structural children saved innerHTML for full DOM restoration.
-  const htmlElements = document.querySelectorAll('[data-original-html]');
+  // Find elements with saved HTML content in the WeakMap.
+  // We need to scan the DOM since WeakMap keys are not enumerable.
+  let htmlRestored = 0;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+  const htmlElements = [];
+  let node = walker.nextNode();
+  while (node) {
+    if (originalContentMap.has(node)) {
+      htmlElements.push(node);
+    }
+    node = walker.nextNode();
+  }
+
   htmlElements.forEach((element) => {
-    element.innerHTML = element.getAttribute('data-original-html');
-    element.removeAttribute('data-original-html');
-    element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
-    element.style.backgroundColor = '';
+    const saved = originalContentMap.get(element);
+    if (saved && saved.type === 'html') {
+      element.innerHTML = saved.value;
+      element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
+      element.style.backgroundColor = '';
+      originalContentMap.delete(element);
+      htmlRestored++;
+    }
   });
 
   // Simple elements only saved their direct text.
@@ -659,7 +718,7 @@ function restoreOriginals() {
     element.style.backgroundColor = '';
   });
 
-  return { success: true, restoredCount: htmlElements.length + textElements.length };
+  return { success: true, restoredCount: htmlRestored + textElements.length };
 }
 
 // Listen for messages from background script
@@ -702,8 +761,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // Async response
 });
 
-// Expose functions on window for testing
-if (typeof window !== 'undefined' && window.__EVCHAN_DEBUG__) {
+// Expose functions on window for testing (stripped in production builds via esbuild define)
+// __EVCHAN_DEBUG__ is set to 'false' by esbuild in production, or defined in vitest config for tests.
+if (typeof __EVCHAN_DEBUG__ !== 'undefined' && __EVCHAN_DEBUG__) {
   window.__evchan_content__ = {
     getTranslationState,
     setShouldCancel,
@@ -715,6 +775,8 @@ if (typeof window !== 'undefined' && window.__EVCHAN_DEBUG__) {
     getDirectText,
     hasStructuralChildren,
     translateMixedContent,
+    sanitizeHtml,
+    originalContentMap,
     translateBatch,
     extractTextNodes,
     groupNodesIntoBatches,

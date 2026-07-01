@@ -14,7 +14,7 @@ global.chrome = chromeStub;
 describe('Content Script', () => {
   let isVisible, shouldSkipElement, hasDirectText, hasStructuralChildren, extractTextNodes;
   let groupNodesIntoBatches;
-  let translateMixedContent;
+  let translateMixedContent, sanitizeHtml, originalContentMap;
   let highlightElement, unhighlightElement, markFailed;
   let sendProgress, translateElement, translatePage, restoreOriginals;
   let detectPageLanguage;
@@ -45,9 +45,6 @@ describe('Content Script', () => {
     // Reset module to get fresh state (isTranslating, shouldCancel)
     vi.resetModules();
 
-    // Enable debug mode so window.__evchan_content__ is exposed for testing
-    window.__EVCHAN_DEBUG__ = true;
-
     // Clear mock call history
     sendMessage.mockClear();
 
@@ -61,6 +58,8 @@ describe('Content Script', () => {
     hasDirectText = content.hasDirectText;
     hasStructuralChildren = content.hasStructuralChildren;
     translateMixedContent = content.translateMixedContent;
+    sanitizeHtml = content.sanitizeHtml;
+    originalContentMap = content.originalContentMap;
     extractTextNodes = content.extractTextNodes;
     groupNodesIntoBatches = content.groupNodesIntoBatches;
     highlightElement = content.highlightElement;
@@ -298,6 +297,137 @@ describe('Content Script', () => {
 
       await expect(translateMixedContent(p, {}, 'en')).rejects.toThrow('API timeout');
     });
+
+    it('strips script tags from LLM response', async () => {
+      sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'TRANSLATE_HTML') {
+          return {
+            success: true,
+            translated: '<p>Text <script>alert(1)</script> safe</p>',
+          };
+        }
+        return {};
+      });
+
+      document.body.innerHTML = '<div><p>See <a>link</a></p></div>';
+      const p = $('p');
+
+      await translateMixedContent(p, {}, 'en');
+
+      expect(p.querySelector('script')).toBeNull();
+      expect(p.textContent).toBe('Text  safe');
+    });
+
+    it('strips event handler attributes from LLM response', async () => {
+      sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'TRANSLATE_HTML') {
+          return {
+            success: true,
+            translated: '<p><img src="x" onerror="alert(1)"> text</p>',
+          };
+        }
+        return {};
+      });
+
+      document.body.innerHTML = '<div><p>See <a>link</a></p></div>';
+      const p = $('p');
+
+      await translateMixedContent(p, {}, 'en');
+
+      const img = p.querySelector('img');
+      expect(img).toBeTruthy();
+      expect(img.getAttribute('onerror')).toBeNull();
+      expect(img.getAttribute('src')).toBe('x');
+    });
+
+    it('strips iframe and object tags from LLM response', async () => {
+      sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'TRANSLATE_HTML') {
+          return {
+            success: true,
+            translated:
+              '<p>Text <iframe src="evil.com"></iframe> <object data="evil.swf"></object> safe</p>',
+          };
+        }
+        return {};
+      });
+
+      document.body.innerHTML = '<div><p>See <a>link</a></p></div>';
+      const p = $('p');
+
+      await translateMixedContent(p, {}, 'en');
+
+      expect(p.querySelector('iframe')).toBeNull();
+      expect(p.querySelector('object')).toBeNull();
+    });
+  });
+
+  describe('sanitizeHtml', () => {
+    it('removes script tags', () => {
+      const html = '<p>Hello <script>alert(1)</script> world</p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<script>');
+      expect(result).toContain('Hello');
+      expect(result).toContain('world');
+    });
+
+    it('removes iframe tags', () => {
+      const html = '<p>Text <iframe src="evil.com"></iframe> safe</p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<iframe');
+    });
+
+    it('removes object and embed tags', () => {
+      const html = '<p><object data="x.swf"></object><embed src="x.swf"></embed></p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<object');
+      expect(result).not.toContain('<embed');
+    });
+
+    it('removes event handler attributes', () => {
+      const html = '<p><img src="x" onerror="alert(1)"><a onclick="steal()">link</a></p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('onerror');
+      expect(result).not.toContain('onclick');
+      expect(result).toContain('img');
+      expect(result).toContain('a');
+    });
+
+    it('removes link, meta, and base tags', () => {
+      const html =
+        '<p><link rel="stylesheet" href="evil.css"><meta http-equiv="refresh" content="0;url=evil.com"><base href="evil.com"></p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<link');
+      expect(result).not.toContain('<meta');
+      expect(result).not.toContain('<base');
+    });
+
+    it('preserves safe HTML', () => {
+      const html = '<p>Hello <a href="/docs">link</a> <strong>bold</strong> <em>italic</em></p>';
+      const result = sanitizeHtml(html);
+      expect(result).toContain('<a href="/docs">');
+      expect(result).toContain('<strong>');
+      expect(result).toContain('<em>');
+    });
+
+    it('preserves safe attributes', () => {
+      const html = '<p><a href="https://example.com" target="_blank" class="btn">link</a></p>';
+      const result = sanitizeHtml(html);
+      expect(result).toContain('href="https://example.com"');
+      expect(result).toContain('target="_blank"');
+      expect(result).toContain('class="btn"');
+    });
+
+    it('handles empty input', () => {
+      expect(sanitizeHtml('')).toBe('');
+    });
+
+    it('handles input with only dangerous content', () => {
+      const html = '<script>alert(1)</script><iframe src="x"></iframe>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<script>');
+      expect(result).not.toContain('<iframe');
+    });
   });
 
   describe('extractTextNodes', () => {
@@ -405,7 +535,7 @@ describe('Content Script', () => {
       expect(h1.getAttribute('data-original-text')).toBe('Main Heading');
     });
 
-    it('stores original innerHTML in data-original-html for elements with <br>', () => {
+    it('stores original innerHTML in originalContentMap for elements with <br>', () => {
       document.body.innerHTML = `
         <p class="notation-text"><br>
         <br>
@@ -418,9 +548,11 @@ describe('Content Script', () => {
       extractTextNodes();
 
       const p = $('p');
-      // Should save innerHTML (not data-original-text) because <br> is structural
-      expect(p.hasAttribute('data-original-html')).toBe(true);
-      expect(p.getAttribute('data-original-html')).toContain('<br>');
+      // Should save innerHTML in Map (not data-original-text) because <br> is structural
+      expect(originalContentMap.has(p)).toBe(true);
+      const saved = originalContentMap.get(p);
+      expect(saved.type).toBe('html');
+      expect(saved.value).toContain('<br>');
       expect(p.hasAttribute('data-original-text')).toBe(false);
     });
 
@@ -433,17 +565,17 @@ describe('Content Script', () => {
       expect(h1.getAttribute('data-original-text')).toBe('Previous translation');
     });
 
-    it('does not overwrite existing data-original-html', () => {
+    it('does not overwrite existing saved HTML in originalContentMap', () => {
       document.body.innerHTML = `
         <p>See <a href="/link">link</a> here</p>
       `;
       const p = $('p');
-      p.setAttribute('data-original-html', '<a href="/old">stale</a>');
+      originalContentMap.set(p, { type: 'html', value: '<a href="/old">stale</a>' });
 
       extractTextNodes();
 
-      // Should NOT overwrite existing data-original-html
-      expect(p.getAttribute('data-original-html')).toBe('<a href="/old">stale</a>');
+      // Should NOT overwrite existing saved HTML
+      expect(originalContentMap.get(p).value).toBe('<a href="/old">stale</a>');
       // Should NOT set data-original-text either
       expect(p.hasAttribute('data-original-text')).toBe(false);
     });
@@ -566,8 +698,8 @@ describe('Content Script', () => {
       extractTextNodes();
 
       const li = $('li');
-      // The outer <li> should save innerHTML (not just text) since it has a <ul> child
-      expect(li.hasAttribute('data-original-html')).toBe(true);
+      // The outer <li> should save innerHTML in Map (not just text) since it has a <ul> child
+      expect(originalContentMap.has(li)).toBe(true);
       expect(li.hasAttribute('data-original-text')).toBe(false);
     });
 
@@ -578,8 +710,8 @@ describe('Content Script', () => {
       extractTextNodes();
 
       const li = $('li');
-      // The <li> has direct text AND a <s> child → saves innerHTML for preservation
-      expect(li.hasAttribute('data-original-html')).toBe(true);
+      // The <li> has direct text AND a <s> child → saves innerHTML in Map for preservation
+      expect(originalContentMap.has(li)).toBe(true);
       expect(li.hasAttribute('data-original-text')).toBe(false);
     });
 
@@ -590,8 +722,8 @@ describe('Content Script', () => {
       extractTextNodes();
 
       const p = $('p');
-      // The <p> has direct text AND child elements → saves innerHTML
-      expect(p.hasAttribute('data-original-html')).toBe(true);
+      // The <p> has direct text AND child elements → saves innerHTML in Map
+      expect(originalContentMap.has(p)).toBe(true);
       expect(p.hasAttribute('data-original-text')).toBe(false);
     });
   });
@@ -1250,7 +1382,6 @@ describe('Content Script', () => {
     it('sends CONTENT_LOADED message on initialization', async () => {
       vi.resetModules();
 
-      window.__EVCHAN_DEBUG__ = true;
       const loadedSendMessage = vi.fn(() => Promise.resolve({ success: true }));
       global.chrome = {
         runtime: {
@@ -1276,7 +1407,6 @@ describe('Content Script', () => {
     it('calls sendResponse to avoid leaving messaging system in bad state', async () => {
       vi.resetModules();
 
-      window.__EVCHAN_DEBUG__ = true;
       const cancelSendMessage = vi.fn(() => Promise.resolve({ success: true }));
       let capturedOnMessageHandler;
       global.chrome = {
@@ -1581,7 +1711,6 @@ describe('Content Script', () => {
     it('handles thrown exceptions from chrome.runtime.sendMessage', async () => {
       vi.resetModules();
 
-      window.__EVCHAN_DEBUG__ = true;
       let callCount = 0;
       const exceptionSendMessage = vi.fn(() => {
         callCount++;
@@ -1613,7 +1742,6 @@ describe('Content Script', () => {
     it('throws after retry also throws', async () => {
       vi.resetModules();
 
-      window.__EVCHAN_DEBUG__ = true;
       const alwaysFailSendMessage = vi.fn(() => Promise.reject(new Error('Connection closed')));
 
       global.chrome = {
@@ -1683,15 +1811,15 @@ describe('Content Script', () => {
       expect(p.getAttribute('data-original-text')).toBe('Already translated text');
     });
 
-    it('clears stale data-original-html attributes before starting translation', async () => {
+    it('clears stale originalContentMap entries before starting translation', async () => {
       document.documentElement.lang = 'en';
       document.body.innerHTML = `
         <p>See <a href="/link">link</a> here</p>
       `;
 
-      // Simulate leftover attributes from a previous translation
+      // Simulate leftover entries from a previous translation
       const p = $('p');
-      p.setAttribute('data-original-html', '<a href="/old">stale link</a>');
+      originalContentMap.set(p, { type: 'html', value: '<a href="/old">stale link</a>' });
       p.innerHTML = 'See <a href="/new">new link</a> here';
 
       sendMessage.mockImplementation(async (message) => {
@@ -1710,9 +1838,10 @@ describe('Content Script', () => {
 
       expect(result.success).toBe(true);
 
-      // The data-original-html should now be the current DOM state, NOT the stale value
-      expect(p.getAttribute('data-original-html')).not.toBe('<a href="/old">stale link</a>');
-      expect(p.getAttribute('data-original-html')).toContain('new link');
+      // The saved HTML should now be the current DOM state, NOT the stale value
+      const saved = originalContentMap.get(p);
+      expect(saved.value).not.toBe('<a href="/old">stale link</a>');
+      expect(saved.value).toContain('new link');
     });
 
     it('handles second translation after first completes (without restore)', async () => {
@@ -1814,9 +1943,9 @@ describe('Content Script', () => {
 
       // Manually simulate the clear + re-extract that translatePage should do
       // (this tests the expected behavior after the fix)
-      document.querySelectorAll('[data-original-text], [data-original-html]').forEach((el) => {
+      originalContentMap.clear();
+      document.querySelectorAll('[data-original-text]').forEach((el) => {
         el.removeAttribute('data-original-text');
-        el.removeAttribute('data-original-html');
       });
 
       // Now extractTextNodes will re-read fresh

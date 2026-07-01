@@ -3,10 +3,10 @@
   "name": "EVChan Translator",
   "version": "1.0.0",
   "description": "Translate web pages inline using an OpenAI-compatible LLM",
-  "permissions": ["activeTab", "scripting", "storage", "action", "tabs"],
+  "permissions": ["activeTab", "storage", "action", "tabs"],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://* https://*"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*"
   },
   "action": {
     "default_popup": "popup/popup.html",

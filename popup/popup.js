@@ -9,6 +9,20 @@ const STATE_TRANSLATED = 'translated';
 // Consider translation state stale after 5 minutes
 const STALE_THRESHOLD_MS = 5 * 60 * 1000;
 
+/**
+ * Validate that the API endpoint is a well-formed HTTP/HTTPS URL.
+ * Returns true if valid, false otherwise.
+ */
+function isValidEndpoint(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 // DOM elements
 const stateReady = document.getElementById('state-ready');
 const stateTranslating = document.getElementById('state-translating');
@@ -31,6 +45,9 @@ let currentSettings = {
 };
 
 let _isTranslating = false;
+
+// Cache the active tab ID at popup open time to avoid repeated chrome.tabs.query calls
+let cachedTabId = null;
 
 /**
  * Check if a translation state object is stale.
@@ -203,7 +220,7 @@ async function startTranslation() {
     return;
   }
 
-  const tabId = await getActiveTabId();
+  const tabId = cachedTabId;
   if (!tabId) {
     showError('No active tab found');
     return;
@@ -241,7 +258,7 @@ async function startTranslation() {
  * Restore original text.
  */
 async function restoreOriginals() {
-  const tabId = await getActiveTabId();
+  const tabId = cachedTabId;
   if (!tabId) {
     showError('No active tab found');
     return;
@@ -260,7 +277,7 @@ async function restoreOriginals() {
  * Cancel translation.
  */
 async function cancelTranslation() {
-  const tabId = await getActiveTabId();
+  const tabId = cachedTabId;
   if (!tabId) {
     showError('No active tab found');
     return;
@@ -279,8 +296,15 @@ restoreBtn.addEventListener('click', restoreOriginals);
 
 // Update model list when endpoint changes
 apiEndpointInput.addEventListener('change', async () => {
-  currentSettings.apiEndpoint = apiEndpointInput.value.trim();
+  const trimmed = apiEndpointInput.value.trim();
+  currentSettings.apiEndpoint = trimmed;
   await saveSettings();
+
+  if (!isValidEndpoint(trimmed)) {
+    modelSelect.innerHTML = '<option value="">Invalid endpoint</option>';
+    return;
+  }
+
   updateModelDropdown();
 });
 
@@ -303,13 +327,10 @@ chrome.storage.local.onChanged.addListener(async (changes, areaName) => {
   }
 
   // Check for per-tab state changes (key pattern: _translationState-{tabId})
-  if (areaName === 'local') {
-    const tabId = await getActiveTabId();
-    if (tabId) {
-      const key = translationStateKey(tabId);
-      if (changes[key] && changes[key].newValue) {
-        applyPersistedState(changes[key].newValue);
-      }
+  if (areaName === 'local' && cachedTabId) {
+    const key = translationStateKey(cachedTabId);
+    if (changes[key] && changes[key].newValue) {
+      applyPersistedState(changes[key].newValue);
     }
   }
 });
@@ -318,10 +339,12 @@ chrome.storage.local.onChanged.addListener(async (changes, areaName) => {
  * Initialize the popup by loading settings and checking for persisted state.
  */
 async function initialize() {
+  // Cache the active tab ID for the lifetime of this popup
+  cachedTabId = await getActiveTabId();
+
   // Check for persisted translation state for the current active tab
-  const tabId = await getActiveTabId();
-  if (tabId) {
-    const key = translationStateKey(tabId);
+  if (cachedTabId) {
+    const key = translationStateKey(cachedTabId);
     const persistedState = await chrome.storage.local.get(key);
     if (persistedState[key]) {
       applyPersistedState(persistedState[key]);

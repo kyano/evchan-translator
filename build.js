@@ -42,6 +42,8 @@ async function bundle(entry, out) {
     sourcemap: false,
     minify: true,
     logLevel: 'info',
+    // Strip debug exports from production builds
+    define: { __EVCHAN_DEBUG__: 'false' },
   });
 }
 

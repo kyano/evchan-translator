@@ -68,6 +68,7 @@ async function main() {
   await Promise.all([
     copy('manifest.json', join(DIST, 'manifest.json')),
     copy('popup/popup.html', join(DIST, 'popup', 'popup.html')),
+    copy('icons/icon.png', join(DIST, 'icon.png')),
   ]);
 
   // Package ZIP

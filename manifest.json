@@ -8,9 +8,15 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*"
   },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "EVChan Translator"
+    "default_title": "EVChan Translator",
+    "default_icon": "icon.png"
   },
   "background": {
     "service_worker": "background/background.js",

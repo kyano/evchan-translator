@@ -440,6 +440,73 @@ describe('Content Script', () => {
       expect(result).not.toContain('<script>');
       expect(result).not.toContain('<iframe');
     });
+
+    // URL sanitization tests
+    it('strips javascript: URLs from href attributes', () => {
+      const html = '<a href="javascript:alert(1)">click</a>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('javascript:');
+      expect(result).toContain('about:blank');
+    });
+
+    it('strips javascript: URLs from src attributes', () => {
+      const html = '<img src="javascript:alert(1)">';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('javascript:');
+    });
+
+    it('strips data: URLs from href attributes', () => {
+      const html = '<a href="data:text/html,<script>alert(1)</script>">click</a>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('data:text/html');
+      expect(result).toContain('about:blank');
+    });
+
+    it('strips vbscript: URLs (case-insensitive)', () => {
+      const html = '<a href="VBSCRIPT:msgbox(1)">click</a>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('VBSCRIPT');
+      expect(result).toContain('about:blank');
+    });
+
+    it('neutralizes whitespace-padded javascript: URLs', () => {
+      const html = '<a href="  javascript:alert(1)">click</a>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('javascript:');
+      expect(result).toContain('about:blank');
+    });
+
+    it('removes <style> tags', () => {
+      const html = '<p>Text <style>body{display:none}</style> safe</p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<style>');
+      expect(result).toContain('Text');
+      expect(result).toContain('safe');
+    });
+
+    it('removes <svg> tags', () => {
+      const html = '<p>Text <svg><script>alert(1)</script></svg> safe</p>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<svg>');
+      expect(result).not.toContain('<script>');
+    });
+
+    it('removes <form>, <input>, <button> tags', () => {
+      const html = '<form action="evil"><input type="text"><button>Submit</button></form>';
+      const result = sanitizeHtml(html);
+      expect(result).not.toContain('<form');
+      expect(result).not.toContain('<input');
+      expect(result).not.toContain('<button');
+    });
+
+    it('preserves safe URLs (http, https, relative paths)', () => {
+      const html =
+        '<a href="https://example.com">link</a> <a href="/docs">docs</a> <img src="photo.png">';
+      const result = sanitizeHtml(html);
+      expect(result).toContain('href="https://example.com"');
+      expect(result).toContain('href="/docs"');
+      expect(result).toContain('src="photo.png"');
+    });
   });
 
   describe('extractTextNodes', () => {
@@ -914,10 +981,17 @@ describe('Content Script', () => {
   });
 
   describe('restoreOriginals', () => {
+    let translatedElements;
+
+    beforeEach(() => {
+      translatedElements = window.__evchan_content__.translatedElements;
+    });
+
     it('restores text from data-original-text', () => {
       const p = $('p');
       p.setAttribute('data-original-text', 'Original text');
       p.textContent = 'Translated text';
+      translatedElements.add(p);
 
       const result = restoreOriginals();
 
@@ -933,12 +1007,108 @@ describe('Content Script', () => {
       h1.classList.add('evchan-translated');
       h1.classList.add('evchan-failed');
       h1.style.backgroundColor = '#fff59d';
+      translatedElements.add(h1);
 
       restoreOriginals();
 
       expect(h1.classList.contains('evchan-translated')).toBe(false);
       expect(h1.classList.contains('evchan-failed')).toBe(false);
       expect(h1.style.backgroundColor).toBe('');
+    });
+
+    it('uses translatedElements Set instead of full DOM walk', () => {
+      document.body.innerHTML = `
+        <p id="translated">Original</p>
+        <p id="not-translated">Should not be touched</p>
+      `;
+
+      const p = document.getElementById('translated');
+      p.setAttribute('data-original-text', 'Original');
+      p.textContent = 'Translated';
+      translatedElements.add(p);
+
+      const result = restoreOriginals();
+      expect(result.success).toBe(true);
+      expect(p.textContent).toBe('Original');
+      expect(p.hasAttribute('data-original-text')).toBe(false);
+    });
+
+    it('skips elements not in translatedElements Set', () => {
+      document.body.innerHTML = `
+        <p id="in-set">In set</p>
+        <p id="not-in-set">Not in set</p>
+      `;
+
+      const inSet = document.getElementById('in-set');
+      const notInSet = document.getElementById('not-in-set');
+
+      inSet.setAttribute('data-original-text', 'In set original');
+      inSet.textContent = 'In set translated';
+      translatedElements.add(inSet);
+
+      notInSet.setAttribute('data-original-text', 'Not in set original');
+      notInSet.textContent = 'Not in set translated';
+
+      restoreOriginals();
+
+      // Only the element in the set should be restored
+      expect(inSet.textContent).toBe('In set original');
+      expect(inSet.hasAttribute('data-original-text')).toBe(false);
+      // The element not in the set should be untouched
+      expect(notInSet.textContent).toBe('Not in set translated');
+      expect(notInSet.hasAttribute('data-original-text')).toBe(true);
+    });
+
+    it('skips disconnected elements and cleans up Set', () => {
+      document.body.innerHTML = `
+        <p id="disconnected">Will be removed</p>
+        <p id="connected">Stays connected</p>
+      `;
+
+      const disconnected = document.getElementById('disconnected');
+      const connected = document.getElementById('connected');
+
+      disconnected.setAttribute('data-original-text', 'Disconnected original');
+      disconnected.textContent = 'Disconnected translated';
+      translatedElements.add(disconnected);
+
+      connected.setAttribute('data-original-text', 'Connected original');
+      connected.textContent = 'Connected translated';
+      translatedElements.add(connected);
+
+      // Remove one element from DOM before restore
+      disconnected.remove();
+
+      restoreOriginals();
+
+      // Connected element should be restored
+      expect(connected.textContent).toBe('Connected original');
+      expect(connected.hasAttribute('data-original-text')).toBe(false);
+
+      // Disconnected element should be cleaned up from Set
+      expect(translatedElements.has(disconnected)).toBe(false);
+    });
+
+    it('restores structural elements from originalContentMap', () => {
+      document.body.innerHTML = `
+        <p id="structural">See <a href="/link">link</a> here</p>
+      `;
+
+      const p = document.getElementById('structural');
+      const originalHtml = p.innerHTML;
+      originalContentMap.set(p, { type: 'html', value: originalHtml });
+      p.innerHTML = 'See <a href="/new">translated</a> here';
+      p.classList.add('evchan-translated');
+      translatedElements.add(p);
+
+      const result = restoreOriginals();
+
+      expect(result.success).toBe(true);
+      expect(result.restoredCount).toBe(1);
+      expect(p.innerHTML).toBe(originalHtml);
+      expect(p.classList.contains('evchan-translated')).toBe(false);
+      expect(originalContentMap.has(p)).toBe(false);
+      expect(translatedElements.has(p)).toBe(false);
     });
   });
 

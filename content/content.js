@@ -30,6 +30,13 @@ let cachedSelectionAncestor = null;
 const originalContentMap = new Map();
 
 /**
+ * Tracks elements that were translated, for O(k) restore instead of O(n) DOM walk.
+ * Only contains elements that were actually modified during translation.
+ * @type {Set<Element>}
+ */
+const translatedElements = new Set();
+
+/**
  * Send a message to the background with one retry on null response or exception.
  * MV3 service workers can be terminated when idle, causing sendMessage
  * to return null or throw. This mirrors the retry pattern in the background script.
@@ -298,6 +305,7 @@ function extractTextNodes(root = document.body) {
         } else {
           node.setAttribute('data-original-text', text);
         }
+        translatedElements.add(node);
       }
       nodes.push({ element: node, text });
     }
@@ -476,15 +484,63 @@ function sanitizeHtml(html) {
   const doc = parser.parseFromString(html, 'text/html');
 
   // Remove dangerous elements
-  const dangerousTags = ['script', 'iframe', 'object', 'embed', 'link', 'meta', 'base'];
+  const dangerousTags = [
+    'script',
+    'iframe',
+    'object',
+    'embed',
+    'link',
+    'meta',
+    'base',
+    'style',
+    'svg',
+    'math',
+    'form',
+    'input',
+    'button',
+    'textarea',
+    'select',
+    'video',
+    'audio',
+    'source',
+    'track',
+    'picture',
+  ];
   doc.querySelectorAll(dangerousTags.join(',')).forEach((el) => el.remove());
 
-  // Strip event handler attributes (on*) from all elements
+  // URL attributes that can execute code if set to javascript:/data:/vbscript:
+  const urlAttrs = [
+    'href',
+    'src',
+    'action',
+    'formaction',
+    'poster',
+    'data',
+    'background',
+    'cite',
+    'codebase',
+    'longdesc',
+    'usemap',
+  ];
+
+  // Pattern to detect dangerous URL schemes (with optional whitespace)
+  const dangerousUrlPattern = /^(\s*javascript|\s*data|\s*vbscript)\s*[:;|]/i;
+
+  // Strip event handler attributes and sanitize URL attributes
   doc.querySelectorAll('*').forEach((el) => {
     const attrs = [...el.attributes];
     attrs.forEach((attr) => {
-      if (/^on/i.test(attr.name)) {
+      const name = attr.name.toLowerCase();
+
+      // Strip all on* event handlers
+      if (/^on/i.test(name)) {
         el.removeAttribute(attr.name);
+        return;
+      }
+
+      // Neutralize dangerous URLs in URL-bearing attributes
+      if (urlAttrs.includes(name) && dangerousUrlPattern.test(attr.value)) {
+        el.setAttribute(attr.name, 'about:blank');
       }
     });
   });
@@ -680,7 +736,8 @@ async function processStructuralElements(
  * leftover attributes, classes, and styles from previous runs.
  */
 function clearStaleTranslationState() {
-  // Clear saved original content from WeakMap (structural elements).
+  // Clear tracked elements and saved content.
+  translatedElements.clear();
   originalContentMap.clear();
 
   // Remove data-original-text attributes (simple elements).
@@ -799,42 +856,45 @@ async function translateSelection(settings) {
 
 /**
  * Restore all original text content.
+ * Uses translatedElements Set for O(k) restore instead of O(n) DOM walk.
  */
 function restoreOriginals() {
-  // Find elements with saved HTML content in the WeakMap.
-  // We need to scan the DOM since WeakMap keys are not enumerable.
-  let htmlRestored = 0;
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
-  const htmlElements = [];
-  let node = walker.nextNode();
-  while (node) {
-    if (originalContentMap.has(node)) {
-      htmlElements.push(node);
-    }
-    node = walker.nextNode();
-  }
+  let restored = 0;
 
-  htmlElements.forEach((element) => {
+  // Restore from translatedElements Set (O(k) instead of O(n) DOM walk)
+  for (const element of translatedElements) {
+    // Check if element is still in the document
+    if (!element.isConnected) {
+      originalContentMap.delete(element);
+      translatedElements.delete(element);
+      continue;
+    }
+
+    // Structural elements saved in Map
     const saved = originalContentMap.get(element);
     if (saved && saved.type === 'html') {
       element.innerHTML = saved.value;
       element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
       element.style.backgroundColor = '';
       originalContentMap.delete(element);
-      htmlRestored++;
+      translatedElements.delete(element);
+      restored++;
+      continue;
     }
-  });
 
-  // Simple elements only saved their direct text.
-  const textElements = document.querySelectorAll('[data-original-text]');
-  textElements.forEach((element) => {
-    element.textContent = element.getAttribute('data-original-text');
-    element.removeAttribute('data-original-text');
-    element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
-    element.style.backgroundColor = '';
-  });
+    // Simple elements saved as data attribute
+    const originalText = element.getAttribute('data-original-text');
+    if (originalText !== null) {
+      element.textContent = originalText;
+      element.removeAttribute('data-original-text');
+      element.classList.remove(HIGHLIGHT_CLASS, FAILED_CLASS);
+      element.style.backgroundColor = '';
+      translatedElements.delete(element);
+      restored++;
+    }
+  }
 
-  return { success: true, restoredCount: htmlRestored + textElements.length };
+  return { success: true, restoredCount: restored };
 }
 
 // Listen for messages from background script
@@ -904,6 +964,7 @@ if (typeof __EVCHAN_DEBUG__ !== 'undefined' && __EVCHAN_DEBUG__) {
     translateMixedContent,
     sanitizeHtml,
     originalContentMap,
+    translatedElements,
     translateBatch,
     extractTextNodes,
     groupNodesIntoBatches,

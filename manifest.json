@@ -6,7 +6,7 @@
   "permissions": ["activeTab", "storage", "action", "tabs"],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*"
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*; frame-ancestors 'none'"
   },
   "icons": {
     "16": "icon.png",

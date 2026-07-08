@@ -80,11 +80,12 @@ async function getTranslationState(tabId) {
 /**
  * Handle translation requests from the popup.
  */
-async function handleTranslate(tabId, settings) {
+async function handleTranslate(tabId, settings, scope) {
   // Send translation request to content script (always loaded via manifest)
   const response = await sendMessageToContent(tabId, {
     type: 'TRANSLATE_REQUEST',
     settings,
+    scope: scope || 'page',
   });
 
   return response || { success: false, error: 'No response from content script' };
@@ -146,7 +147,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             timestamp: Date.now(),
           });
 
-          const result = await handleTranslate(tabId, message.settings);
+          const result = await handleTranslate(tabId, message.settings, message.scope);
 
           // Update per-tab state with result
           if (result.success) {
@@ -320,6 +321,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
           }
           sendResponse({ success: true });
+          break;
+        }
+
+        case 'CHECK_SELECTION': {
+          const tabId = message.tabId || sender.tab?.id;
+          if (!tabId) {
+            sendResponse({ success: false, error: 'No active tab' });
+            break;
+          }
+          const response = await sendMessageToContent(tabId, { type: 'CHECK_SELECTION' });
+          sendResponse(response || { success: false, error: 'No response from content script' });
           break;
         }
 

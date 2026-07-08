@@ -19,6 +19,12 @@ describe('Content Script', () => {
   let sendProgress, translateElement, translatePage, restoreOriginals;
   let detectPageLanguage;
   let _getTranslationState, _setShouldCancel;
+  let hasSelection,
+    getSelectionAncestor,
+    _updateSelectionCache,
+    clearSelectionCache,
+    _cachedSelectionAncestor,
+    translateSelection;
 
   // DOM helper
   function $(sel) {
@@ -72,6 +78,12 @@ describe('Content Script', () => {
     _getTranslationState = content.getTranslationState;
     _setShouldCancel = content.setShouldCancel;
     detectPageLanguage = content.detectPageLanguage;
+    hasSelection = content.hasSelection;
+    getSelectionAncestor = content.getSelectionAncestor;
+    _updateSelectionCache = content.updateSelectionCache;
+    clearSelectionCache = content.clearSelectionCache;
+    _cachedSelectionAncestor = content.cachedSelectionAncestor;
+    translateSelection = content.translateSelection;
 
     // Set up DOM
     document.body.innerHTML = `
@@ -2007,6 +2019,740 @@ describe('Content Script', () => {
       // All elements should have been translated from their current state
       // First paragraph's original should be "Translated one" (its state before this translation)
       expect(paragraphs[0].getAttribute('data-original-text')).toBe('Translated one');
+    });
+  });
+
+  describe('hasSelection', () => {
+    it('returns true when text is selected (non-collapsed)', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      // Fire selectionchange to populate the cache
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const result = hasSelection();
+      expect(result.hasSelection).toBe(true);
+
+      selection.removeAllRanges();
+    });
+
+    it('returns false when no selection (collapsed)', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      window.getSelection().removeAllRanges();
+
+      const result = hasSelection();
+      expect(result.hasSelection).toBe(false);
+    });
+
+    it('returns false when selection is collapsed (same start/end)', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const range = document.createRange();
+      range.setStart(p.firstChild, 0);
+      range.setEnd(p.firstChild, 0); // collapsed
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      // Fire selectionchange to clear the cache (collapsed selection)
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const result = hasSelection();
+      expect(result.hasSelection).toBe(false);
+
+      selection.removeAllRanges();
+    });
+
+    it('returns false when rangeCount is 0', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      window.getSelection().removeAllRanges();
+
+      const result = hasSelection();
+      expect(result.hasSelection).toBe(false);
+    });
+  });
+
+  describe('selection caching', () => {
+    it('caches selection on selectionchange event', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      // Fire selectionchange to trigger caching
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Now clear the live selection (simulating popup focus loss)
+      selection.removeAllRanges();
+
+      // Cached selection should still be valid
+      const result = hasSelection();
+      expect(result.hasSelection).toBe(true);
+    });
+
+    it('returns cached ancestor after live selection is cleared', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      // Fire selectionchange to trigger caching
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Clear live selection
+      selection.removeAllRanges();
+
+      // Cached ancestor should still be available
+      const ancestor = getSelectionAncestor();
+      expect(ancestor).toBe(p);
+    });
+
+    it('clears cache after successful translateSelection', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = '<p>Hello world</p>';
+      const range = document.createRange();
+      range.selectNodeContents($('p'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      selection.removeAllRanges();
+
+      sendMessage.mockImplementation(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Translated: ' + t) };
+        }
+        return { success: true, translated: 'Translated: ' + message.text };
+      });
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(true);
+      expect(getSelectionAncestor()).toBeNull();
+    });
+
+    it('clearSelectionCache resets cached ancestor', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const range = document.createRange();
+      range.selectNodeContents($('p'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      selection.removeAllRanges();
+
+      expect(hasSelection().hasSelection).toBe(true);
+      clearSelectionCache();
+      expect(hasSelection().hasSelection).toBe(false);
+      expect(getSelectionAncestor()).toBeNull();
+    });
+
+    it('skips selection inside non-translatable elements', () => {
+      document.body.innerHTML = '<textarea>select me</textarea>';
+      const ta = $('textarea');
+      const range = document.createRange();
+      range.selectNodeContents(ta);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Should not cache because textarea is a skipped element
+      expect(hasSelection().hasSelection).toBe(false);
+    });
+
+    it('clears cache when selection becomes collapsed', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const selection = window.getSelection();
+
+      // First, select text
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Cache should be set
+      expect(hasSelection().hasSelection).toBe(true);
+
+      // Now deselect (simulate user clicking elsewhere)
+      selection.removeAllRanges();
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Cache should be cleared - BUG: currently it is NOT cleared
+      expect(hasSelection().hasSelection).toBe(false);
+      expect(getSelectionAncestor()).toBeNull();
+    });
+
+    it('clears cache when selection moves to non-translatable element', () => {
+      document.body.innerHTML = `
+        <p>Hello world</p>
+        <code>const x = 1;</code>
+      `;
+      const p = $('p');
+      const code = $('code');
+      const selection = window.getSelection();
+
+      // First, select text in <p>
+      const range1 = document.createRange();
+      range1.selectNodeContents(p);
+      selection.removeAllRanges();
+      selection.addRange(range1);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Cache should be set
+      expect(getSelectionAncestor()).toBe(p);
+
+      // Now select inside <code> (non-translatable)
+      const range2 = document.createRange();
+      range2.selectNodeContents(code);
+      selection.removeAllRanges();
+      selection.addRange(range2);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Cache should be cleared (not stale from <p>)
+      expect(hasSelection().hasSelection).toBe(false);
+      expect(getSelectionAncestor()).toBeNull();
+
+      selection.removeAllRanges();
+    });
+  });
+
+  describe('getSelectionAncestor', () => {
+    it('returns the common ancestor element of the selection', () => {
+      document.body.innerHTML = `
+        <article>
+          <p>Hello <strong>world</strong></p>
+        </article>
+      `;
+      const p = $('p');
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const ancestor = getSelectionAncestor();
+      expect(ancestor).toBe(p);
+
+      selection.removeAllRanges();
+    });
+
+    it('returns parentElement when common ancestor is a Text node', () => {
+      document.body.innerHTML = '<p>Hello world</p>';
+      const p = $('p');
+      const range = document.createRange();
+      range.setStart(p.firstChild, 0);
+      range.setEnd(p.firstChild, 5);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const ancestor = getSelectionAncestor();
+      expect(ancestor).toBe(p);
+
+      selection.removeAllRanges();
+    });
+
+    it('returns ancestor spanning multiple child elements', () => {
+      document.body.innerHTML = `
+        <div>
+          <p>First paragraph</p>
+          <p>Second paragraph</p>
+        </div>
+      `;
+      const paragraphs = $$('p');
+      const range = document.createRange();
+      range.setStart(paragraphs[0].firstChild, 0);
+      range.setEnd(paragraphs[1].firstChild, paragraphs[1].firstChild.length);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const ancestor = getSelectionAncestor();
+      expect(ancestor).toBe($('div'));
+
+      selection.removeAllRanges();
+    });
+
+    it('returns null when no selection', () => {
+      document.body.innerHTML = '<p>Hello</p>';
+      window.getSelection().removeAllRanges();
+
+      const ancestor = getSelectionAncestor();
+      expect(ancestor).toBeNull();
+    });
+  });
+
+  describe('extractTextNodes with root parameter', () => {
+    it('defaults to document.body when no root provided', () => {
+      document.body.innerHTML = `
+        <div id="a"><p>In A</p></div>
+        <div id="b"><p>In B</p></div>
+      `;
+      const nodes = extractTextNodes();
+      const texts = nodes.map((n) => n.text.trim());
+
+      expect(texts).toContain('In A');
+      expect(texts).toContain('In B');
+    });
+
+    it('only extracts nodes within the given root element', () => {
+      document.body.innerHTML = `
+        <div id="a"><p>In A</p></div>
+        <div id="b"><p>In B</p></div>
+      `;
+      const rootA = document.getElementById('a');
+      const nodes = extractTextNodes(rootA);
+      const texts = nodes.map((n) => n.text.trim());
+
+      expect(texts).toContain('In A');
+      expect(texts).not.toContain('In B');
+    });
+
+    it('returns empty array when root has no translatable text', () => {
+      document.body.innerHTML = `
+        <div id="a"><p>In A</p></div>
+        <div id="b"></div>
+      `;
+      const rootB = document.getElementById('b');
+      const nodes = extractTextNodes(rootB);
+      expect(nodes).toEqual([]);
+    });
+
+    it('respects visibility and skip rules within scoped root', () => {
+      document.body.innerHTML = `
+        <div id="root">
+          <p>Visible text</p>
+          <p style="display:none;">Hidden text</p>
+          <script>var x = 1;</script>
+        </div>
+      `;
+      const root = document.getElementById('root');
+      const nodes = extractTextNodes(root);
+      const texts = nodes.map((n) => n.text.trim());
+
+      expect(texts).toContain('Visible text');
+      expect(texts).not.toContain('Hidden text');
+      expect(texts).not.toContain('var x = 1;');
+    });
+  });
+
+  describe('translateSelection', () => {
+    it('returns error when no valid selection', async () => {
+      document.body.innerHTML = '<p>Hello</p>';
+      window.getSelection().removeAllRanges();
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('No valid selection');
+    });
+
+    it('translates only nodes within selection ancestor', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = `
+        <div id="outside"><p>Outside text</p></div>
+        <div id="inside">
+          <p>Inside text one</p>
+          <p>Inside text two</p>
+        </div>
+      `;
+
+      // Create selection within #inside
+      const inside = document.getElementById('inside');
+      const range = document.createRange();
+      range.selectNodeContents(inside);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      sendMessage.mockImplementation(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Translated: ' + t) };
+        }
+        return { success: true, translated: 'Translated: ' + message.text };
+      });
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.translatedCount).toBe(2);
+
+      // Inside texts should be translated
+      expect(document.getElementById('inside').querySelectorAll('p')[0].textContent).toContain(
+        'Translated'
+      );
+      expect(document.getElementById('inside').querySelectorAll('p')[1].textContent).toContain(
+        'Translated'
+      );
+
+      // Outside text should be unchanged
+      expect(document.getElementById('outside').querySelector('p').textContent).toBe(
+        'Outside text'
+      );
+
+      selection.removeAllRanges();
+    });
+
+    it('reuses same translation pipeline as translatePage', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = `
+        <div id="scope">
+          <p>Plain text</p>
+          <p>Mixed <a href="/link">link</a> content</p>
+        </div>
+      `;
+
+      const scope = document.getElementById('scope');
+      const range = document.createRange();
+      range.selectNodeContents(scope);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const callTypes = [];
+      sendMessage.mockImplementation(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        callTypes.push(message.type);
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Batch: ' + t) };
+        }
+        if (message.type === 'TRANSLATE_HTML') {
+          return {
+            success: true,
+            translated: '<p>Mixed <a href="/link">link</a> translated</p>',
+          };
+        }
+        return { success: true, translated: 'default' };
+      });
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(true);
+      // Should use both batch and HTML translation (same pipeline as translatePage)
+      expect(callTypes).toContain('TRANSLATE_CHUNK_BATCH');
+      expect(callTypes).toContain('TRANSLATE_HTML');
+
+      selection.removeAllRanges();
+    });
+
+    it('does not clear cache when translation fails (no translatable text)', async () => {
+      // Use a div with only hidden content - selection caches the div,
+      // but extractTextNodes finds nothing translatable
+      document.body.innerHTML = `
+        <p>Hello world</p>
+        <div id="empty"><span style="display:none">hidden</span></div>
+      `;
+      const emptyDiv = document.getElementById('empty');
+      const range = document.createRange();
+      range.selectNodeContents(emptyDiv);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('No translatable text found');
+      // Cache should NOT be cleared when translation fails
+      expect(getSelectionAncestor()).toBe(emptyDiv);
+
+      selection.removeAllRanges();
+    });
+
+    it('clears cache when translation succeeds', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = '<p>Hello world</p>';
+      const range = document.createRange();
+      range.selectNodeContents($('p'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      selection.removeAllRanges();
+
+      sendMessage.mockImplementation(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Translated: ' + t) };
+        }
+        return { success: true, translated: 'Translated: ' + message.text };
+      });
+
+      const result = await translateSelection({
+        apiEndpoint: 'http://test.com/v1',
+        model: 'gpt-4',
+        targetLanguage: 'es',
+      });
+
+      expect(result.success).toBe(true);
+      // Cache IS cleared on success
+      expect(getSelectionAncestor()).toBeNull();
+    });
+  });
+
+  describe('CHECK_SELECTION message', () => {
+    it('returns hasSelection true when text is selected', async () => {
+      vi.resetModules();
+
+      const checkSendMessage = vi.fn(() => Promise.resolve({ success: true }));
+      let capturedOnMessageHandler;
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: checkSendMessage,
+          onMessage: {
+            addListener: vi.fn((handler) => {
+              capturedOnMessageHandler = handler;
+            }),
+          },
+        },
+      };
+
+      document.body.innerHTML = '<p>Hello world</p>';
+      await import('../content/content.js');
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Create selection
+      const p = $('p');
+      const range = document.createRange();
+      range.selectNodeContents(p);
+      window.getSelection().addRange(range);
+      // Fire selectionchange AFTER import so the listener is registered
+      document.dispatchEvent(new Event('selectionchange'));
+
+      // Simulate CHECK_SELECTION message
+      let responseReceived = null;
+      const mockSendResponse = (response) => {
+        responseReceived = response;
+      };
+
+      capturedOnMessageHandler(
+        { type: 'CHECK_SELECTION' },
+        { id: 'test-extension-id' },
+        mockSendResponse
+      );
+
+      // Wait for async handler
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(responseReceived).toEqual({ success: true, hasSelection: true });
+
+      window.getSelection().removeAllRanges();
+    });
+
+    it('returns hasSelection false when no selection', async () => {
+      vi.resetModules();
+
+      const checkSendMessage = vi.fn(() => Promise.resolve({ success: true }));
+      let capturedOnMessageHandler;
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: checkSendMessage,
+          onMessage: {
+            addListener: vi.fn((handler) => {
+              capturedOnMessageHandler = handler;
+            }),
+          },
+        },
+      };
+
+      document.body.innerHTML = '<p>Hello world</p>';
+      window.getSelection().removeAllRanges();
+      await import('../content/content.js');
+      await new Promise((r) => setTimeout(r, 10));
+
+      let responseReceived = null;
+      const mockSendResponse = (response) => {
+        responseReceived = response;
+      };
+
+      capturedOnMessageHandler(
+        { type: 'CHECK_SELECTION' },
+        { id: 'test-extension-id' },
+        mockSendResponse
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(responseReceived).toEqual({ success: true, hasSelection: false });
+    });
+  });
+
+  describe('TRANSLATE_REQUEST with scope selection', () => {
+    it('calls translateSelection when scope is selection', async () => {
+      vi.resetModules();
+
+      const scopeSendMessage = vi.fn(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Translated: ' + t) };
+        }
+        return { success: true, translated: 'Translated: ' + message.text };
+      });
+      let capturedOnMessageHandler;
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: scopeSendMessage,
+          onMessage: {
+            addListener: vi.fn((handler) => {
+              capturedOnMessageHandler = handler;
+            }),
+          },
+        },
+      };
+
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = `
+        <div id="outside"><p>Outside text</p></div>
+        <div id="inside"><p>Inside text</p></div>
+      `;
+
+      // Create selection within #inside
+      const inside = document.getElementById('inside');
+      const range = document.createRange();
+      range.selectNodeContents(inside);
+      window.getSelection().addRange(range);
+
+      await import('../content/content.js');
+      // Fire selectionchange AFTER import so the listener is registered
+      document.dispatchEvent(new Event('selectionchange'));
+      await new Promise((r) => setTimeout(r, 10));
+
+      let responseReceived = null;
+      const mockSendResponse = (response) => {
+        responseReceived = response;
+      };
+
+      capturedOnMessageHandler(
+        {
+          type: 'TRANSLATE_REQUEST',
+          scope: 'selection',
+          settings: {
+            apiEndpoint: 'http://test.com/v1',
+            model: 'gpt-4',
+            targetLanguage: 'es',
+          },
+        },
+        { id: 'test-extension-id' },
+        mockSendResponse
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(responseReceived.success).toBe(true);
+      // Only inside text should be translated
+      expect(document.getElementById('inside').querySelector('p').textContent).toContain(
+        'Translated'
+      );
+      // Outside text should be unchanged
+      expect(document.getElementById('outside').querySelector('p').textContent).toBe(
+        'Outside text'
+      );
+
+      window.getSelection().removeAllRanges();
+    });
+
+    it('calls translatePage when scope is page or omitted', async () => {
+      vi.resetModules();
+
+      const pageScopeSendMessage = vi.fn(async (message) => {
+        if (message.type === 'PROGRESS') return { acknowledged: true };
+        if (message.type === 'TRANSLATE_CHUNK_BATCH') {
+          return { success: true, translated: message.texts.map((t) => 'Translated: ' + t) };
+        }
+        return { success: true, translated: 'Translated: ' + message.text };
+      });
+      let capturedOnMessageHandler;
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: pageScopeSendMessage,
+          onMessage: {
+            addListener: vi.fn((handler) => {
+              capturedOnMessageHandler = handler;
+            }),
+          },
+        },
+      };
+
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = `
+        <div id="a"><p>Text A</p></div>
+        <div id="b"><p>Text B</p></div>
+      `;
+
+      await import('../content/content.js');
+      await new Promise((r) => setTimeout(r, 10));
+
+      let responseReceived = null;
+      const mockSendResponse = (response) => {
+        responseReceived = response;
+      };
+
+      capturedOnMessageHandler(
+        {
+          type: 'TRANSLATE_REQUEST',
+          scope: 'page',
+          settings: {
+            apiEndpoint: 'http://test.com/v1',
+            model: 'gpt-4',
+            targetLanguage: 'es',
+          },
+        },
+        { id: 'test-extension-id' },
+        mockSendResponse
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(responseReceived.success).toBe(true);
+      // Both should be translated (full page)
+      expect(document.getElementById('a').querySelector('p').textContent).toContain('Translated');
+      expect(document.getElementById('b').querySelector('p').textContent).toContain('Translated');
     });
   });
 });

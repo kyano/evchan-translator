@@ -19,7 +19,8 @@ const popupHTML = `
         <label for="target-language">Target Language</label>
         <input type="text" id="target-language" placeholder="e.g., English, Japanese, Chinese">
       </div>
-      <button id="translate-btn" class="btn btn-primary">Translate</button>
+      <button id="translate-btn" class="btn btn-primary">Translate Page</button>
+      <button id="translate-selection-btn" class="btn btn-primary hidden">Translate Selection</button>
     </div>
     <div id="state-translating" class="state hidden">
       <h1>Translating...</h1>
@@ -705,6 +706,268 @@ describe('Popup', () => {
       // Should show ready state since the translating state is stale
       expect(document.getElementById('state-ready').classList.contains('hidden')).toBe(false);
       expect(document.getElementById('state-translating').classList.contains('hidden')).toBe(true);
+    });
+  });
+
+  describe('selection mode', () => {
+    it('hides selection button by default', async () => {
+      const selBtn = document.getElementById('translate-selection-btn');
+      expect(selBtn.classList.contains('hidden')).toBe(true);
+    });
+
+    it('shows selection button when CHECK_SELECTION returns hasSelection true', async () => {
+      vi.resetModules();
+
+      const chromeStub = createChromeStub();
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: '', model: '', targetLanguage: '' };
+        }
+        return null;
+      });
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(50);
+
+      const selBtn = document.getElementById('translate-selection-btn');
+      expect(selBtn.classList.contains('hidden')).toBe(false);
+    });
+
+    it('hides selection button when CHECK_SELECTION returns hasSelection false', async () => {
+      vi.resetModules();
+
+      const chromeStub = createChromeStub();
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: false };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: '', model: '', targetLanguage: '' };
+        }
+        return null;
+      });
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(50);
+
+      const selBtn = document.getElementById('translate-selection-btn');
+      expect(selBtn.classList.contains('hidden')).toBe(true);
+    });
+
+    it('hides selection button when CHECK_SELECTION throws', async () => {
+      vi.resetModules();
+
+      const chromeStub = createChromeStub();
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          throw new Error('content script not found');
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: '', model: '', targetLanguage: '' };
+        }
+        return null;
+      });
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(50);
+
+      const selBtn = document.getElementById('translate-selection-btn');
+      expect(selBtn.classList.contains('hidden')).toBe(true);
+    });
+
+    it('sends TRANSLATE with scope selection when selection button clicked', async () => {
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: 'http://test.com/v1', model: 'gpt-4o', targetLanguage: 'Japanese' };
+        }
+        if (msg.type === 'TRANSLATE') {
+          return { success: true, translatedCount: 3, failedCount: 0 };
+        }
+        return { success: true };
+      });
+
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      vi.resetModules();
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(100);
+
+      document.getElementById('translate-selection-btn').click();
+      await flush(50);
+
+      expect(chromeStub.runtime.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'TRANSLATE',
+          tabId: 42,
+          scope: 'selection',
+        })
+      );
+    });
+
+    it('disables both buttons during selection translation', async () => {
+      let resolveTranslation;
+      const translationPromise = new Promise((resolve) => {
+        resolveTranslation = resolve;
+      });
+
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: 'http://test.com/v1', model: 'gpt-4o', targetLanguage: 'Japanese' };
+        }
+        if (msg.type === 'TRANSLATE') {
+          await translationPromise;
+          return { success: true, translatedCount: 3, failedCount: 0 };
+        }
+        return { success: true };
+      });
+
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      vi.resetModules();
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(100);
+
+      document.getElementById('translate-selection-btn').click();
+      await flush(20);
+
+      expect(document.getElementById('translate-btn').disabled).toBe(true);
+      expect(document.getElementById('translate-selection-btn').disabled).toBe(true);
+
+      // Resolve the translation
+      resolveTranslation();
+      await flush(50);
+
+      expect(document.getElementById('translate-btn').disabled).toBe(false);
+      expect(document.getElementById('translate-selection-btn').disabled).toBe(false);
+    });
+
+    it('shows translated state on successful selection translation', async () => {
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: 'http://test.com/v1', model: 'gpt-4o', targetLanguage: 'Japanese' };
+        }
+        if (msg.type === 'TRANSLATE') {
+          return { success: true, translatedCount: 3, failedCount: 0 };
+        }
+        return { success: true };
+      });
+
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      vi.resetModules();
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(100);
+
+      document.getElementById('translate-selection-btn').click();
+      await flush(50);
+
+      expect(document.getElementById('state-translated').classList.contains('hidden')).toBe(false);
+      expect(document.getElementById('translation-summary').textContent).toContain('3');
+    });
+
+    it('shows error when selection translation fails', async () => {
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: 'http://test.com/v1', model: 'gpt-4o', targetLanguage: 'Japanese' };
+        }
+        if (msg.type === 'TRANSLATE') {
+          return { success: false, error: 'Selection scope has no translatable content' };
+        }
+        return { success: true };
+      });
+
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ id: 'gpt-4o' }] }),
+      });
+
+      vi.resetModules();
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(100);
+
+      document.getElementById('translate-selection-btn').click();
+      await flush(50);
+
+      expect(document.getElementById('state-ready').classList.contains('hidden')).toBe(false);
+      expect(document.getElementById('error-message').textContent).toContain(
+        'Selection scope has no translatable content'
+      );
+    });
+
+    it('validates settings before selection translation', async () => {
+      chromeStub.runtime.sendMessage.mockImplementation(async (msg) => {
+        if (msg.type === 'CHECK_SELECTION') {
+          return { hasSelection: true };
+        }
+        if (msg.type === 'LOAD_SETTINGS') {
+          return { apiEndpoint: '', model: '', targetLanguage: '' };
+        }
+        return null;
+      });
+
+      vi.resetModules();
+      global.chrome = chromeStub;
+      global.fetch = fetchMock;
+      document.body.innerHTML = popupHTML;
+
+      await import('../popup/popup.js');
+      await flush(100);
+
+      document.getElementById('translate-selection-btn').click();
+      await flush(50);
+
+      expect(document.getElementById('error-message').textContent).toBe(
+        'Please set the API endpoint in the extension settings.'
+      );
     });
   });
 });

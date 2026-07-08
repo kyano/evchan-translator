@@ -26,6 +26,7 @@ export default [
         AbortController: 'readonly',
         AbortSignal: 'readonly',
         NodeFilter: 'readonly',
+        Node: 'readonly',
         MutationObserver: 'readonly',
         DOMParser: 'readonly',
         // Built-in types

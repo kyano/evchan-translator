@@ -30,6 +30,10 @@ User clicks toolbar button
 
 ## Translation Flow
 
+### Page Mode (default)
+
+Translates all visible text on the active tab.
+
 1. User clicks toolbar button → popup opens
 2. User enters target language (free-text), selects model from fetched list
 3. Content script (auto-loaded) extracts all visible text nodes from the DOM, storing originals in `data-original-text` (plain text) or `data-original-html` (structural elements) attributes
@@ -42,6 +46,25 @@ User clicks toolbar button
 10. Failed elements are highlighted in red (`#ffcdd2`)
 11. **Cancel** — user can cancel mid-translation via a "Cancel" button; an `AbortController` per tab aborts in-flight requests
 12. **Restore clears state** — clicking "Restore Original" clears all `data-original-text`/`data-original-html` attributes, returning the page to its pre-translation state
+
+### Selection Mode
+
+Translates only the scope of the user's text selection.
+
+1. User selects text on the page, then opens the popup
+2. Popup auto-detects selection via a message to the content script and shows a "Translate Selection" button
+3. User clicks "Translate Selection"
+4. Content script calls `window.getSelection()` to get the selection range, then finds the smallest common ancestor element via `selection.getRangeAt(0).commonAncestorContainer` (normalized to an Element if the container is a Text node)
+5. Only translatable nodes within that ancestor subtree are extracted — the existing `extractTextNodes()` function is scoped to the ancestor instead of `document.body`
+6. Translation proceeds using the existing batch + HTML concurrent pipeline
+7. Only elements within the selection scope are highlighted and translated
+8. "Restore Original" restores only the translated elements, leaving the rest of the page untouched
+
+**Edge cases:**
+
+- Selection spans multiple top-level containers (e.g., across `<article>` and `<aside>`): the common ancestor may be `<body>`, effectively translating the whole page. This is acceptable — the user selected broadly, so broad translation is expected.
+- Selection is inside a skipped element (e.g., `<textarea>`, `<code>`): treated as no selection — nothing to translate.
+- No selection or collapsed selection: popup hides the "Translate Selection" button.
 
 ## Prompts
 
@@ -165,6 +188,22 @@ Persisted in `storage.local`:
 
 **Highlight color** — hardcoded to `#fff59d` (not user-configurable).
 
+## Popup UI — Selection Mode
+
+The popup shows two translation triggers:
+
+- **"Translate Page"** button — translates the entire page (existing behavior).
+- **"Translate Selection"** button — translates only the selected text scope.
+  - Hidden when no text is selected on the active tab.
+  - Shown when the content script reports an active selection.
+
+On popup open, the popup queries the content script for selection state:
+
+- If a selection exists (non-collapsed range), show both buttons.
+- If no selection, show only "Translate Page".
+
+The selection check is a lightweight message — only a boolean is transferred (no text content).
+
 ## Manifest
 
 ### Permissions
@@ -189,7 +228,7 @@ Persisted in `storage.local`:
 | Translation backend | OpenAI-compatible API                                                                     | Flexible, any compatible provider                                                        |
 | Source language     | From HTML `lang` attribute, or inferred by LLM                                            | No API call for detection; LLM infers when unknown                                       |
 | Target language     | User-set via popup free-text                                                              | Flexible, no predefined list                                                             |
-| Translation scope   | All visible text nodes, active tab only                                                   | Complete translation, tab-scoped                                                         |
+| Translation scope   | All visible text nodes (page mode) or selection ancestor subtree (selection mode)         | Complete translation, tab-scoped or selection-scoped                                     |
 | Script injection    | Auto-injected via manifest on all URLs                                                    | Simpler than on-demand; content script always ready                                      |
 | Batching            | Plain text batched dynamically (~1,000 chars / max 20 items per call) / innerHTML (mixed) | Reduces API calls; mixed content preserved                                               |
 | Batch fallback      | Failed batches retry items individually                                                   | Graceful degradation                                                                     |
@@ -208,10 +247,31 @@ Persisted in `storage.local`:
 - **Cancellation**: User can cancel mid-translation; in-flight requests are aborted via `AbortController`
 - **State staleness**: Popup discards per-tab state older than 5 minutes
 
+## Message Protocol — Selection
+
+New and extended messages for selection mode (added to existing protocol):
+
+| Direction            | Type                                                 | Purpose                               |
+| -------------------- | ---------------------------------------------------- | ------------------------------------- |
+| Popup → Background   | `CHECK_SELECTION`                                    | Ask if text is selected on active tab |
+| Background → Content | `CHECK_SELECTION`                                    | Forward to content script             |
+| Content → Background | `{ type: 'SELECTION_CHECK', hasSelection: boolean }` | Report selection state                |
+| Popup → Background   | `TRANSLATE` (with `scope: 'selection'`)              | Request scoped translation            |
+| Background → Content | `TRANSLATE_REQUEST` (with `scope: 'selection'`)      | Forward scoped request                |
+
+The existing `TRANSLATE_REQUEST` message gains an optional `scope` field:
+
+- `'page'` (default) — translate entire page (existing behavior)
+- `'selection'` — translate only selection scope
+
+The content script's message handler checks `message.scope`:
+
+- If `'selection'`, calls the new `translateSelection()` function.
+- Otherwise (or omitted), calls the existing `translatePage()` (unchanged).
+
 ## Non-Goals (v1)
 
 - Keyboard shortcuts
-- Selected text translation
 - Multiple language pairs simultaneously
 - Translation memory / history
 - Export translated page

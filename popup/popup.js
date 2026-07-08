@@ -31,6 +31,7 @@ const apiEndpointInput = document.getElementById('api-endpoint');
 const modelSelect = document.getElementById('model');
 const targetLanguageInput = document.getElementById('target-language');
 const translateBtn = document.getElementById('translate-btn');
+const translateSelectionBtn = document.getElementById('translate-selection-btn');
 const cancelBtn = document.getElementById('cancel-btn');
 const restoreBtn = document.getElementById('restore-btn');
 const progressFill = document.getElementById('progress-fill');
@@ -134,6 +135,27 @@ function showState(state) {
 }
 
 /**
+ * Check with content script whether there is an active text selection.
+ * Shows the selection button if so, hides it otherwise.
+ */
+async function checkSelection() {
+  if (!cachedTabId) return;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'CHECK_SELECTION',
+      tabId: cachedTabId,
+    });
+    if (response && response.hasSelection) {
+      translateSelectionBtn.classList.remove('hidden');
+    } else {
+      translateSelectionBtn.classList.add('hidden');
+    }
+  } catch {
+    translateSelectionBtn.classList.add('hidden');
+  }
+}
+
+/**
  * Load settings from background script.
  */
 async function loadSettings() {
@@ -198,9 +220,9 @@ async function updateModelDropdown() {
 }
 
 /**
- * Start translation.
+ * Perform translation with the given scope ('page' or 'selection').
  */
-async function startTranslation() {
+async function doTranslation(scope) {
   // Save current settings
   await saveSettings();
 
@@ -229,12 +251,14 @@ async function startTranslation() {
   _isTranslating = true;
   showState(STATE_TRANSLATING);
   translateBtn.disabled = true;
+  translateSelectionBtn.disabled = true;
 
   try {
     const result = await chrome.runtime.sendMessage({
       type: 'TRANSLATE',
       tabId,
       settings: currentSettings,
+      scope,
     });
 
     if (result.success) {
@@ -251,7 +275,15 @@ async function startTranslation() {
   } finally {
     _isTranslating = false;
     translateBtn.disabled = false;
+    translateSelectionBtn.disabled = false;
   }
+}
+
+/**
+ * Start page-wide translation.
+ */
+async function startTranslation() {
+  await doTranslation('page');
 }
 
 /**
@@ -291,6 +323,7 @@ async function cancelTranslation() {
 
 // Event listeners
 translateBtn.addEventListener('click', startTranslation);
+translateSelectionBtn.addEventListener('click', () => doTranslation('selection'));
 cancelBtn.addEventListener('click', cancelTranslation);
 restoreBtn.addEventListener('click', restoreOriginals);
 
@@ -350,6 +383,9 @@ async function initialize() {
       applyPersistedState(persistedState[key]);
     }
   }
+
+  // Check for active text selection to show/hide selection button
+  checkSelection();
 
   // Load settings (always needed for form fields)
   loadSettings();

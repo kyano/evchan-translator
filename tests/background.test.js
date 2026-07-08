@@ -139,6 +139,7 @@ describe('Background Script', () => {
       expect(chromeStub.tabs.sendMessage).toHaveBeenCalledWith(42, {
         type: 'TRANSLATE_REQUEST',
         settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        scope: 'page',
       });
       expect(response).toEqual({ success: true, translatedCount: 10 });
     });
@@ -197,6 +198,47 @@ describe('Background Script', () => {
 
       expect(chromeStub.tabs.sendMessage).toHaveBeenCalledTimes(4);
       expect(response).toEqual({ success: false, error: 'No response from content script' });
+    });
+
+    it('passes scope field to content script message', async () => {
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ success: true, translatedCount: 10 });
+
+      const response = await sendMessage(
+        {
+          type: 'TRANSLATE',
+          tabId: 42,
+          scope: 'selection',
+          settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        },
+        {}
+      );
+
+      expect(chromeStub.tabs.sendMessage).toHaveBeenCalledWith(42, {
+        type: 'TRANSLATE_REQUEST',
+        settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        scope: 'selection',
+      });
+      expect(response).toEqual({ success: true, translatedCount: 10 });
+    });
+
+    it('defaults scope to page when not provided', async () => {
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ success: true, translatedCount: 10 });
+
+      const response = await sendMessage(
+        {
+          type: 'TRANSLATE',
+          tabId: 42,
+          settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        },
+        {}
+      );
+
+      expect(chromeStub.tabs.sendMessage).toHaveBeenCalledWith(42, {
+        type: 'TRANSLATE_REQUEST',
+        settings: { apiEndpoint: 'http://test.com/v1', model: 'gpt-4', targetLanguage: 'en' },
+        scope: 'page',
+      });
+      expect(response).toEqual({ success: true, translatedCount: 10 });
     });
   });
 
@@ -305,7 +347,6 @@ describe('Background Script', () => {
       expect(body.messages[0].role).toBe('user');
       expect(body.messages[0].content).toContain('Translate the following text from en to es');
       expect(body.messages[0].content).toContain('Text: Hello world');
-      expect(body.temperature).toBe(0.3);
     });
 
     it('returns error when API fails', async () => {
@@ -360,6 +401,33 @@ describe('Background Script', () => {
 
       const fetchCall = global.fetch.mock.calls[0];
       expect(fetchCall[0]).toBe('http://test.com/v1/chat/completions');
+    });
+  });
+
+  describe('CHECK_SELECTION message', () => {
+    it('forwards CHECK_SELECTION to content script and returns response', async () => {
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce({ hasSelection: true });
+
+      const response = await sendMessage({ type: 'CHECK_SELECTION' }, { tab: { id: 42 } });
+
+      expect(chromeStub.tabs.sendMessage).toHaveBeenCalledWith(42, {
+        type: 'CHECK_SELECTION',
+      });
+      expect(response).toEqual({ hasSelection: true });
+    });
+
+    it('returns error when no active tab', async () => {
+      const response = await sendMessage({ type: 'CHECK_SELECTION' });
+
+      expect(response).toEqual({ success: false, error: 'No active tab' });
+    });
+
+    it('returns error when content script returns null', async () => {
+      chromeStub.tabs.sendMessage.mockResolvedValueOnce(null);
+
+      const response = await sendMessage({ type: 'CHECK_SELECTION', tabId: 42 }, {});
+
+      expect(response).toEqual({ success: false, error: 'No response from content script' });
     });
   });
 

@@ -14,6 +14,14 @@ let isTranslating = false;
 let shouldCancel = false;
 
 /**
+ * Cached selection ancestor element, populated on `selectionchange` events.
+ * The browser clears window.getSelection() when the extension popup opens
+ * (focus shift), so we cache the ancestor at selection time for later use.
+ * @type {Element | null}
+ */
+let cachedSelectionAncestor = null;
+
+/**
  * Store original HTML content for elements with structural children.
  * Uses Map to avoid storing HTML as data attributes (prevents tampering).
  * Cleared on each translation cycle (clearStaleTranslationState, restoreOriginals).
@@ -156,85 +164,135 @@ function hasStructuralChildren(element) {
 }
 
 /**
+ * Check if the user has an active (non-collapsed) text selection.
+ * Uses the cached selection ancestor (populated on selectionchange)
+ * because the browser clears window.getSelection() when the popup opens.
+ * @returns {{ hasSelection: boolean }}
+ */
+function hasSelection() {
+  // Read cache directly. The selectionchange handler keeps it up-to-date.
+  // Do NOT call updateSelectionCache() here because the browser clears
+  // window.getSelection() when the popup opens, which would wipe the cache.
+  return { hasSelection: cachedSelectionAncestor !== null };
+}
+
+/**
+ * Update the cached selection ancestor from the live window selection.
+ * Called on selectionchange events. Clears the cache when the selection
+ * is invalid (collapsed, empty, or inside a non-translatable element).
+ */
+function updateSelectionCache() {
+  // Clear cache first; repopulate below if selection is valid.
+  cachedSelectionAncestor = null;
+
+  const selection = window.getSelection();
+  if (selection.rangeCount === 0 || selection.isCollapsed) {
+    return;
+  }
+
+  const container = selection.getRangeAt(0).commonAncestorContainer;
+  if (!container) {
+    return;
+  }
+
+  // Skip if selection is inside a non-translatable element
+  const ancestorEl = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
+  if (ancestorEl && !shouldSkipElement(ancestorEl)) {
+    cachedSelectionAncestor = ancestorEl;
+  }
+}
+
+/**
+ * Get the cached common ancestor Element of the last text selection.
+ * Returns null when there is no valid cached selection.
+ * @returns {Element | null}
+ */
+function getSelectionAncestor() {
+  return cachedSelectionAncestor;
+}
+
+/**
+ * Clear the cached selection. Called after translation or on page navigation.
+ */
+function clearSelectionCache() {
+  cachedSelectionAncestor = null;
+}
+
+/**
  * Extract all translatable text nodes from the DOM.
  * Only accepts leaf elements that have direct text content,
  * avoiding parent containers whose textContent replacement would destroy child structure.
  * Structural children of accepted elements are skipped — the parent handles them
  * via HTML-based translation to preserve context for correct word ordering.
  * Returns an array of { element, text, originalText } objects.
+ * @param {Element} [root=document.body] - Root element to scope extraction (default: document.body)
  */
-function extractTextNodes() {
+function extractTextNodes(root = document.body) {
   const nodes = [];
   // Track elements that were accepted and have direct text.
   // Their structural children will be skipped since the parent handles them.
   const processedWithDirectText = new Set();
 
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
-    acceptNode: (node) => {
-      // Skip non-content elements (scripts, styles, inputs, etc.)
-      if (shouldSkipElement(node)) {
-        return NodeFilter.FILTER_REJECT;
+  /**
+   * Check if a node should be accepted for extraction.
+   * Returns 'accept', 'skip', or 'reject'.
+   */
+  function evaluateNode(node) {
+    // Skip non-content elements (scripts, styles, inputs, etc.)
+    if (shouldSkipElement(node)) {
+      return 'reject';
+    }
+
+    const style = window.getComputedStyle(node);
+
+    // display: contents elements have no box of their own; skip the element
+    // but still walk its descendants
+    if (style.display === 'contents') {
+      return 'skip';
+    }
+
+    // Skip hidden elements
+    if (!isVisible(node, style)) {
+      return 'reject';
+    }
+
+    // Skip elements with no text content
+    if (node.textContent.trim().length === 0) {
+      return 'reject';
+    }
+
+    // Only accept elements with direct text nodes.
+    // Pure containers inherit text from descendants but replacing their
+    // textContent would destroy nested HTML structure.
+    if (!hasDirectText(node)) {
+      return 'skip';
+    }
+
+    // Skip if an ancestor was already accepted with direct text and has children.
+    let parent = node.parentElement;
+    while (parent) {
+      if (processedWithDirectText.has(parent) && parent.children.length > 0) {
+        return 'skip';
       }
+      parent = parent.parentElement;
+    }
 
-      const style = window.getComputedStyle(node);
+    return 'accept';
+  }
 
-      // display: contents elements have no box of their own; skip the element
-      // but still walk its descendants (FILTER_SKIP instead of FILTER_REJECT)
-      if (style.display === 'contents') {
-        return NodeFilter.FILTER_SKIP;
-      }
-
-      // Skip hidden elements (pass cached style to avoid re-query)
-      if (!isVisible(node, style)) {
-        return NodeFilter.FILTER_REJECT;
-      }
-
-      // Skip elements with no text content
-      if (node.textContent.trim().length === 0) {
-        return NodeFilter.FILTER_REJECT;
-      }
-
-      // Only accept elements with direct text nodes.
-      // Pure containers (like <div><h1>...</h1></div>) inherit text from descendants
-      // but replacing their textContent would destroy nested HTML structure.
-      if (!hasDirectText(node)) {
-        return NodeFilter.FILTER_SKIP;
-      }
-
-      // Skip if an ancestor was already accepted with direct text and has children.
-      // That ancestor will handle all descendants via HTML-based translation,
-      // which provides full context for correct word ordering.
-      let parent = node.parentElement;
-      while (parent) {
-        if (processedWithDirectText.has(parent) && parent.children.length > 0) {
-          return NodeFilter.FILTER_SKIP;
-        }
-        parent = parent.parentElement;
-      }
-
-      return NodeFilter.FILTER_ACCEPT;
-    },
-  });
-
-  let node = walker.nextNode();
-  while (node) {
-    // Track elements with direct text for child-skipping logic
+  /**
+   * Process an accepted node: save original content and add to results.
+   */
+  function processNode(node) {
     if (hasDirectText(node)) {
       processedWithDirectText.add(node);
     }
 
-    // Only extract direct text (excludes <script> content and descendant text).
-    // node.textContent would include script contents, polluting the translation.
     const text = getDirectText(node);
     if (text.trim().length > 0) {
-      // Skip if already processed (has saved original content)
       const hasSavedHtml = originalContentMap.has(node);
       const hasSavedText = node.hasAttribute('data-original-text');
       if (!hasSavedHtml && !hasSavedText) {
-        // For elements with structural children, save innerHTML in WeakMap
-        // so restore can reconstruct the full DOM (preserving <script>, <a>, etc.).
-        // Stored in JS memory to prevent attribute tampering.
-        // For simple elements, saving textContent of direct text nodes is enough.
         if (hasStructuralChildren(node)) {
           originalContentMap.set(node, { type: 'html', value: node.innerHTML });
         } else {
@@ -243,6 +301,32 @@ function extractTextNodes() {
       }
       nodes.push({ element: node, text });
     }
+  }
+
+  // Evaluate the root element first (TreeWalker.nextNode() skips the root).
+  const rootResult = evaluateNode(root);
+  if (rootResult === 'accept') {
+    processNode(root);
+  }
+
+  // If root was rejected, don't walk descendants.
+  if (rootResult === 'reject') {
+    return nodes;
+  }
+
+  // Walk descendants (root was 'skip' or 'accept', both allow walking children).
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode: (node) => {
+      const result = evaluateNode(node);
+      if (result === 'accept') return NodeFilter.FILTER_ACCEPT;
+      if (result === 'skip') return NodeFilter.FILTER_SKIP;
+      return NodeFilter.FILTER_REJECT;
+    },
+  });
+
+  let node = walker.nextNode();
+  while (node) {
+    processNode(node);
     node = walker.nextNode();
   }
 
@@ -612,10 +696,14 @@ function clearStaleTranslationState() {
 }
 
 /**
- * Main translation function. Two-phase: collect nodes, then translate concurrently.
+ * Internal: translate nodes within a given root element.
+ * Two-phase: collect nodes, then translate concurrently.
  * Runs plain batch translation and HTML translation in parallel (concurrency level 2).
+ * @param {Element} root - Root element to scope node extraction
+ * @param {object} settings - Translation settings
+ * @returns {Promise<{success: boolean, translatedCount?: number, failedCount?: number, error?: string}>}
  */
-async function translatePage(settings) {
+async function translateNodes(root, settings) {
   if (isTranslating) {
     return { success: false, error: 'Translation already in progress' };
   }
@@ -629,7 +717,7 @@ async function translatePage(settings) {
     clearStaleTranslationState();
 
     // --- Phase 1: Collect ---
-    const nodes = extractTextNodes();
+    const nodes = extractTextNodes(root);
     const total = nodes.length;
 
     if (total === 0) {
@@ -682,6 +770,34 @@ async function translatePage(settings) {
 }
 
 /**
+ * Public: translate entire page (default scope).
+ * @param {object} settings - Translation settings
+ * @returns {Promise<{success: boolean, translatedCount?: number, failedCount?: number, error?: string}>}
+ */
+async function translatePage(settings) {
+  return translateNodes(document.body, settings);
+}
+
+/**
+ * Public: translate only the scope of the user's text selection.
+ * Gets the cached selection ancestor element and scopes translation to that subtree.
+ * Clears the cached selection only on successful translation.
+ * @param {object} settings - Translation settings
+ * @returns {Promise<{success: boolean, translatedCount?: number, failedCount?: number, error?: string}>}
+ */
+async function translateSelection(settings) {
+  const ancestor = getSelectionAncestor();
+  if (!ancestor) {
+    return { success: false, error: 'No valid selection' };
+  }
+  const result = await translateNodes(ancestor, settings);
+  if (result.success) {
+    clearSelectionCache();
+  }
+  return result;
+}
+
+/**
  * Restore all original text content.
  */
 function restoreOriginals() {
@@ -730,8 +846,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case 'TRANSLATE_REQUEST': {
-          const result = await translatePage(message.settings);
+          const fn = message.scope === 'selection' ? translateSelection : translatePage;
+          const result = await fn(message.settings);
           sendResponse(result);
+          break;
+        }
+
+        case 'CHECK_SELECTION': {
+          const result = hasSelection();
+          sendResponse({ success: true, hasSelection: result.hasSelection });
           break;
         }
 
@@ -761,6 +884,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // Async response
 });
 
+// Cache the selection ancestor on selectionchange events.
+// This runs before the popup opens, so the selection is still live.
+document.addEventListener('selectionchange', updateSelectionCache);
+
 // Expose functions on window for testing (stripped in production builds via esbuild define)
 // __EVCHAN_DEBUG__ is set to 'false' by esbuild in production, or defined in vitest config for tests.
 if (typeof __EVCHAN_DEBUG__ !== 'undefined' && __EVCHAN_DEBUG__) {
@@ -787,6 +914,13 @@ if (typeof __EVCHAN_DEBUG__ !== 'undefined' && __EVCHAN_DEBUG__) {
     sendMessageWithRetry,
     translateElement,
     translatePage,
+    translateNodes,
+    translateSelection,
+    hasSelection,
+    getSelectionAncestor,
+    updateSelectionCache,
+    clearSelectionCache,
+    cachedSelectionAncestor,
     restoreOriginals,
     clearStaleTranslationState,
   };

@@ -78,6 +78,12 @@ select:focus {
   cursor: not-allowed;
 }
 
+.btn-primary.deemphasized {
+  padding: 8px 16px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
 .btn-secondary {
   background: #f0f0f0;
   color: #333333;
@@ -85,6 +91,18 @@ select:focus {
 
 .btn-secondary:hover {
   background: #e0e0e0;
+}
+
+.btn-selection {
+  background: #e69500;
+  color: #ffffff;
+  padding: 12px 16px;
+  font-size: 15px;
+  margin-top: 8px;
+}
+
+.btn-selection:hover {
+  background: #cc8500;
 }
 
 .progress-bar {

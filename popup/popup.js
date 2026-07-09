@@ -147,11 +147,14 @@ async function checkSelection() {
     });
     if (response && response.hasSelection) {
       translateSelectionBtn.classList.remove('hidden');
+      translateBtn.classList.add('deemphasized');
     } else {
       translateSelectionBtn.classList.add('hidden');
+      translateBtn.classList.remove('deemphasized');
     }
   } catch {
     translateSelectionBtn.classList.add('hidden');
+    translateBtn.classList.remove('deemphasized');
   }
 }
 

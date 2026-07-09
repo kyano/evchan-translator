@@ -13,10 +13,15 @@
 EVChan-Translator/
 ├── manifest.json           # Extension manifest (MV3)
 ├── package.json            # npm config, test scripts
+├── build.js                # Build script (bundles and copies to dist/)
 ├── eslint.config.js        # ESLint configuration (flat config)
 ├── vitest.config.js        # Vitest config (jsdom, globals)
 ├── SPECS.md                # Requirements specification
 ├── AGENTS.md               # This file
+├── README.md               # Project README
+├── icons/
+│   ├── icon.png            # Extension icon (PNG)
+│   └── icon.svg            # Extension icon (SVG)
 ├── background/
 │   └── background.js       # Extension background/service worker
 ├── content/

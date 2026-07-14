@@ -7,7 +7,7 @@ const popupHTML = `
       <h1>EVChan Translator</h1>
       <div class="form-group">
         <label for="api-endpoint">API Endpoint</label>
-        <input type="text" id="api-endpoint" placeholder="http://localhost:11434">
+        <input type="text" id="api-endpoint" placeholder="https://iu-llama-cpp.linecorp.com/">
       </div>
       <div class="form-group">
         <label for="model">Model</label>
@@ -724,7 +724,11 @@ describe('Popup', () => {
           return { hasSelection: true };
         }
         if (msg.type === 'LOAD_SETTINGS') {
-          return { apiEndpoint: '', model: '', targetLanguage: '' };
+          return {
+            apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+            model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+            targetLanguage: '한국어',
+          };
         }
         return null;
       });
@@ -748,7 +752,11 @@ describe('Popup', () => {
           return { hasSelection: false };
         }
         if (msg.type === 'LOAD_SETTINGS') {
-          return { apiEndpoint: '', model: '', targetLanguage: '' };
+          return {
+            apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+            model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+            targetLanguage: '한국어',
+          };
         }
         return null;
       });
@@ -772,7 +780,11 @@ describe('Popup', () => {
           throw new Error('content script not found');
         }
         if (msg.type === 'LOAD_SETTINGS') {
-          return { apiEndpoint: '', model: '', targetLanguage: '' };
+          return {
+            apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+            model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+            targetLanguage: '한국어',
+          };
         }
         return null;
       });
@@ -949,7 +961,11 @@ describe('Popup', () => {
           return { hasSelection: true };
         }
         if (msg.type === 'LOAD_SETTINGS') {
-          return { apiEndpoint: '', model: '', targetLanguage: '' };
+          return {
+            apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+            model: '',
+            targetLanguage: '한국어',
+          };
         }
         return null;
       });
@@ -965,9 +981,7 @@ describe('Popup', () => {
       document.getElementById('translate-selection-btn').click();
       await flush(50);
 
-      expect(document.getElementById('error-message').textContent).toBe(
-        'Please set the API endpoint in the extension settings.'
-      );
+      expect(document.getElementById('error-message').textContent).toBe('Please select a model.');
     });
   });
 });

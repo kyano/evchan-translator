@@ -78,9 +78,9 @@ describe('Background Script', () => {
       const response = await sendMessage({ type: 'LOAD_SETTINGS' });
 
       expect(response).toEqual({
-        apiEndpoint: '',
-        model: '',
-        targetLanguage: '',
+        apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+        model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+        targetLanguage: '한국어',
       });
     });
 
@@ -94,7 +94,7 @@ describe('Background Script', () => {
 
       expect(response.apiEndpoint).toBe('http://localhost:11434/v1');
       expect(response.model).toBe('llama-3');
-      expect(response.targetLanguage).toBe('');
+      expect(response.targetLanguage).toBe('한국어');
     });
 
     it('SAVE_SETTINGS persists to storage and returns success', async () => {

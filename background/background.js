@@ -5,9 +5,9 @@ import { translateText, translateTextBatch, translateHtml } from '../lib/api.js'
 import { retryAsync } from '../lib/retry.js';
 
 const DEFAULT_SETTINGS = {
-  apiEndpoint: '',
-  model: '',
-  targetLanguage: '',
+  apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
+  model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+  targetLanguage: '한국어',
 };
 
 // Track per-tab AbortControllers for in-flight cancellation

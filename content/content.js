@@ -5,13 +5,22 @@ const HIGHLIGHT_CLASS = 'evchan-translated';
 const FAILED_CLASS = 'evchan-failed';
 const HIGHLIGHT_COLOR = '#fff59d';
 const HIGHLIGHT_DURATION = 3000; // ms
-const MESSAGE_RETRY_DELAY = 300; // ms to wait before retrying a message
+const MESSAGE_RETRY_DELAY = 200; // ms base delay for message retries
+const MAX_MESSAGE_RETRIES = 3; // max retry attempts for background messages
 const BATCH_CHAR_LIMIT = 1_000; // target character count per batch
 const MAX_BATCH_ITEMS = 20; // safety cap on items per batch
+const KEEPALIVE_INTERVAL_MS = 10_000; // ping background every 10s to prevent MV3 service worker termination
 
 // Track state
 let isTranslating = false;
 let shouldCancel = false;
+
+/**
+ * Keep-alive interval ID. Prevents Chrome MV3 from terminating
+ * the background service worker during long-running translations.
+ * @type {number | null}
+ */
+let keepaliveIntervalId = null;
 
 /**
  * Cached selection ancestor element, populated on `selectionchange` events.
@@ -37,23 +46,33 @@ const originalContentMap = new Map();
 const translatedElements = new Set();
 
 /**
- * Send a message to the background with one retry on null response or exception.
+ * Send a message to the background with retries and exponential backoff.
  * MV3 service workers can be terminated when idle, causing sendMessage
- * to return null or throw. This mirrors the retry pattern in the background script.
+ * to return null or throw. We retry up to MAX_MESSAGE_RETRIES times
+ * with increasing delays (200ms, 400ms, 600ms) to handle cold-starts.
  */
 async function sendMessageWithRetry(message) {
-  try {
-    const response = await chrome.runtime.sendMessage(message);
-    if (response !== null) {
-      return response;
+  let lastError;
+
+  for (let attempt = 0; attempt <= MAX_MESSAGE_RETRIES; attempt++) {
+    try {
+      const response = await chrome.runtime.sendMessage(message);
+      if (response !== null) {
+        return response;
+      }
+      // null response — service worker terminated; will retry
+      lastError = 'Background service unavailable';
+    } catch (error) {
+      lastError = error.message || String(error);
     }
-  } catch {
-    // Service worker may be terminated; will retry below.
+
+    // Wait with exponential backoff before retry (skip after last attempt)
+    if (attempt < MAX_MESSAGE_RETRIES) {
+      await new Promise((r) => setTimeout(r, MESSAGE_RETRY_DELAY * (attempt + 1)));
+    }
   }
 
-  // Service worker may be cold-starting; wait and retry once.
-  await new Promise((r) => setTimeout(r, MESSAGE_RETRY_DELAY));
-  return chrome.runtime.sendMessage(message);
+  throw new Error(lastError);
 }
 
 /** @returns {{ isTranslating: boolean, shouldCancel: boolean }} */
@@ -420,6 +439,31 @@ function sendProgress(current, total, status) {
 }
 
 /**
+ * Start keep-alive ping to prevent Chrome MV3 service worker termination.
+ * Sends a KEEPALIVE message every KEEPALIVE_INTERVAL_MS (10s).
+ * Safe to call multiple times (no-op if already running).
+ */
+function startKeepalive() {
+  if (keepaliveIntervalId !== null) {
+    return;
+  }
+  keepaliveIntervalId = setInterval(() => {
+    chrome.runtime.sendMessage({ type: 'KEEPALIVE' }).catch(() => {});
+  }, KEEPALIVE_INTERVAL_MS);
+}
+
+/**
+ * Stop keep-alive ping. Safe to call when not running.
+ */
+function stopKeepalive() {
+  if (keepaliveIntervalId === null) {
+    return;
+  }
+  clearInterval(keepaliveIntervalId);
+  keepaliveIntervalId = null;
+}
+
+/**
  * Translate a single text segment.
  */
 async function translateSegment(text, settings, sourceLang) {
@@ -768,6 +812,9 @@ async function translateNodes(root, settings) {
   isTranslating = true;
   shouldCancel = false;
 
+  // Start keep-alive to prevent Chrome MV3 service worker termination
+  startKeepalive();
+
   try {
     // Clear stale state from any previous translation (cancelled or completed).
     // This ensures extractTextNodes reads current DOM, not leftover attributes.
@@ -823,6 +870,7 @@ async function translateNodes(root, settings) {
     };
   } finally {
     isTranslating = false;
+    stopKeepalive();
   }
 }
 
@@ -984,6 +1032,9 @@ if (typeof __EVCHAN_DEBUG__ !== 'undefined' && __EVCHAN_DEBUG__) {
     cachedSelectionAncestor,
     restoreOriginals,
     clearStaleTranslationState,
+    startKeepalive,
+    stopKeepalive,
+    keepaliveIntervalId,
   };
 }
 

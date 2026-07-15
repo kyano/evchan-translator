@@ -322,11 +322,17 @@ describe('Background Script', () => {
 
   describe('TRANSLATE_CHUNK message', () => {
     it('forwards to LLM API and returns translated text', async () => {
+      const sseData =
+        'data: {"id":"1","choices":[{"delta":{"content":"Hola mundo"},"index":0}]}\n\ndata: [DONE]\n';
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sseData));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({
-          choices: [{ message: { content: 'Hola mundo' } }],
-        }),
+        body: stream,
       });
 
       const response = await sendMessage({
@@ -368,9 +374,15 @@ describe('Background Script', () => {
     });
 
     it('returns error when API response has invalid format', async () => {
+      const emptyStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n'));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ choices: [] }),
+        body: emptyStream,
       });
 
       const response = await sendMessage({
@@ -385,11 +397,17 @@ describe('Background Script', () => {
     });
 
     it('trims trailing slashes from endpoint', async () => {
+      const sseData =
+        'data: {"id":"1","choices":[{"delta":{"content":"Hola"},"index":0}]}\n\ndata: [DONE]\n';
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sseData));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({
-          choices: [{ message: { content: 'Hola' } }],
-        }),
+        body: stream,
       });
 
       await sendMessage({
@@ -436,6 +454,20 @@ describe('Background Script', () => {
       const response = await sendMessage({ type: 'UNKNOWN_TYPE' });
 
       expect(response).toEqual({ success: false, error: 'Unknown message type' });
+    });
+  });
+
+  describe('KEEPALIVE', () => {
+    it('returns { success: true }', async () => {
+      const response = await sendMessage({ type: 'KEEPALIVE' });
+
+      expect(response).toEqual({ success: true });
+    });
+
+    it('works with no sender tab', async () => {
+      const response = await sendMessage({ type: 'KEEPALIVE' }, {});
+
+      expect(response).toEqual({ success: true });
     });
   });
 

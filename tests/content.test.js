@@ -25,6 +25,7 @@ describe('Content Script', () => {
     clearSelectionCache,
     _cachedSelectionAncestor,
     translateSelection;
+  let startKeepalive, stopKeepalive, _keepaliveIntervalId;
 
   // DOM helper
   function $(sel) {
@@ -84,6 +85,9 @@ describe('Content Script', () => {
     clearSelectionCache = content.clearSelectionCache;
     _cachedSelectionAncestor = content.cachedSelectionAncestor;
     translateSelection = content.translateSelection;
+    startKeepalive = content.startKeepalive;
+    stopKeepalive = content.stopKeepalive;
+    _keepaliveIntervalId = content.keepaliveIntervalId;
 
     // Set up DOM
     document.body.innerHTML = `
@@ -1112,6 +1116,81 @@ describe('Content Script', () => {
     });
   });
 
+  describe('keep-alive', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      stopKeepalive();
+    });
+
+    it('startKeepalive sends periodic KEEPALIVE messages', () => {
+      sendMessage.mockClear();
+      startKeepalive();
+
+      // No message sent immediately
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      // Advance 10s — first ping
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledWith({ type: 'KEEPALIVE' });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+
+      // Advance another 10s — second ping
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('stopKeepalive stops periodic messages', () => {
+      sendMessage.mockClear();
+      startKeepalive();
+
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+
+      stopKeepalive();
+      sendMessage.mockClear();
+
+      vi.advanceTimersByTime(20_000);
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('double startKeepalive is safe (no duplicate intervals)', () => {
+      sendMessage.mockClear();
+      startKeepalive();
+      startKeepalive();
+
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('double stopKeepalive is safe', () => {
+      stopKeepalive();
+      stopKeepalive();
+      // No errors thrown
+    });
+
+    it('keepaliveIntervalId is null when not running', () => {
+      stopKeepalive();
+      expect(_keepaliveIntervalId).toBeNull();
+    });
+
+    it('keepaliveIntervalId is set when running', () => {
+      startKeepalive();
+      // Verify interval is active by checking that messages continue to be sent
+      sendMessage.mockClear();
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(10_000);
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('detectPageLanguage', () => {
     it('returns lang from <html lang="ja">', () => {
       document.documentElement.lang = 'ja';
@@ -1948,7 +2027,99 @@ describe('Content Script', () => {
         sendMessageWithRetry({ type: 'TRANSLATE_CHUNK', text: 'Hello' })
       ).rejects.toThrow('Connection closed');
 
-      expect(alwaysFailSendMessage).toHaveBeenCalledTimes(2);
+      expect(alwaysFailSendMessage).toHaveBeenCalledTimes(4);
+    });
+
+    it('handles null response with multiple retries', async () => {
+      vi.useFakeTimers();
+      vi.resetModules();
+
+      let callCount = 0;
+      const nullThenSuccessSendMessage = vi.fn(() => {
+        callCount++;
+        if (callCount <= 2) return Promise.resolve(null); // first two attempts return null
+        return Promise.resolve({ success: true, translated: 'Translated text' });
+      });
+
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: nullThenSuccessSendMessage,
+          onMessage: { addListener: vi.fn() },
+        },
+      };
+
+      document.body.innerHTML = '<p>Test content</p>';
+      await import('../content/content.js');
+      await vi.advanceTimersByTimeAsync(10);
+
+      const content = window.__evchan_content__;
+      const sendMessageWithRetry = content.sendMessageWithRetry;
+
+      // Clear calls from CONTENT_LOADED initialization
+      nullThenSuccessSendMessage.mockClear();
+      callCount = 0;
+
+      // Start the call — it will block on the first setTimeout (200ms)
+      const promise = sendMessageWithRetry({ type: 'TRANSLATE_CHUNK', text: 'Hello' });
+      // Advance past first retry delay (200ms) → triggers 2nd attempt (returns null)
+      await vi.advanceTimersByTimeAsync(201);
+      // Advance past second retry delay (400ms) → triggers 3rd attempt (succeeds)
+      await vi.advanceTimersByTimeAsync(401);
+
+      const result = await promise;
+      expect(result).toEqual({ success: true, translated: 'Translated text' });
+      expect(nullThenSuccessSendMessage).toHaveBeenCalledTimes(3);
+
+      vi.useRealTimers();
+    });
+
+    it('throws after exhausting all retries with null responses', async () => {
+      vi.useFakeTimers();
+      vi.resetModules();
+
+      const alwaysNullSendMessage = vi.fn(() => Promise.resolve(null));
+
+      global.chrome = {
+        runtime: {
+          id: 'test-extension-id',
+          sendMessage: alwaysNullSendMessage,
+          onMessage: { addListener: vi.fn() },
+        },
+      };
+
+      document.body.innerHTML = '<p>Test content</p>';
+      await import('../content/content.js');
+      await vi.advanceTimersByTimeAsync(10);
+
+      const content = window.__evchan_content__;
+      const sendMessageWithRetry = content.sendMessageWithRetry;
+
+      // Clear calls from CONTENT_LOADED initialization
+      alwaysNullSendMessage.mockClear();
+
+      // Start the call — blocks on first setTimeout
+      const promise = sendMessageWithRetry({ type: 'TRANSLATE_CHUNK', text: 'Hello' });
+
+      // Prevent unhandled rejection: attach catch handler before advancing timers
+      let caughtError;
+      promise.catch((e) => {
+        caughtError = e;
+      });
+
+      // Advance through all retry delays: 200ms, 400ms, 600ms
+      await vi.advanceTimersByTimeAsync(201);
+      await vi.advanceTimersByTimeAsync(401);
+      await vi.advanceTimersByTimeAsync(601);
+
+      // Allow microtask to settle
+      await Promise.resolve();
+
+      expect(caughtError).toBeInstanceOf(Error);
+      expect(caughtError.message).toBe('Background service unavailable');
+      expect(alwaysNullSendMessage).toHaveBeenCalledTimes(4);
+
+      vi.useRealTimers();
     });
   });
 

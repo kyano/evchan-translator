@@ -49,7 +49,8 @@ Translates all visible text on the active tab.
 13. **API/Network errors** — displayed in the popup status area; user can retry
 14. **State staleness** — popup discards per-tab state older than 5 minutes
 15. **API timeout** — each translation request has a 600-second timeout to prevent hung requests
-16. **Output sanitization** — before injecting translated content into the DOM, sanitize the output:
+16. **Service worker keep-alive** — Chrome MV3 terminates the background service worker after ~30 seconds of inactivity. During translation, the content script sends `KEEPALIVE` messages to the background every 10 seconds to prevent termination. The keep-alive starts at the beginning of `translateNodes()` and stops in the `finally` block, covering all translation paths (success, failure, cancel).
+17. **Output sanitization** — before injecting translated content into the DOM, sanitize the output:
     - Strip `<script>` tags and their contents
     - Strip event handler attributes (`on*`)
     - Strip `javascript:` and `data:text/html` URIs in `href`/`src` attributes
@@ -227,6 +228,16 @@ Persisted in `storage.local`:
 | Host Permission | Purpose                         |
 | --------------- | ------------------------------- |
 | `<all_urls>`    | Extension works on any web page |
+
+## Message Protocol — Keep-Alive
+
+Prevents Chrome MV3 service worker termination during long-running translations.
+
+| Direction            | Type        | Purpose                                                       |
+| -------------------- | ----------- | ------------------------------------------------------------- |
+| Content → Background | `KEEPALIVE` | Prevent service worker termination (~30s idle timeout in MV3) |
+
+Fired every 10 seconds from `setInterval` in the content script during translation. The background responds with `{ success: true }`. Started at the beginning of `translateNodes()`, stopped in the `finally` block.
 
 ## Message Protocol — Selection
 

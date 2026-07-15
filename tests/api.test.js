@@ -13,6 +13,99 @@ import {
   stripMarkdownFences,
 } from '../lib/api.js';
 
+// --- SSE Mock Helpers ---
+
+function createSseChunk(content) {
+  return `data: {"id":"1","choices":[{"delta":{"content":${JSON.stringify(content)}},"index":0}]}`;
+}
+
+function createSseMockResponse(contentChunks) {
+  // contentChunks is an array of strings, e.g., ['Hel', 'lo']
+  // Returns a Response-like object with a ReadableStream body emitting SSE lines.
+  const sseData =
+    contentChunks.map((chunk) => createSseChunk(chunk)).join('\n\n') + '\n\ndata: [DONE]\n';
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseData));
+      controller.close();
+    },
+  });
+
+  return {
+    ok: true,
+    body: stream,
+  };
+}
+
+function createSseMockResponseSplit(contentChunks) {
+  // Emits SSE data in multiple small enqueues to simulate partial reads.
+  const lines =
+    contentChunks.map((chunk) => createSseChunk(chunk)).join('\n\n') + '\n\ndata: [DONE]\n';
+
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(lines);
+
+  // Split into roughly equal pieces to test accumulation across reads.
+  const mid = Math.floor(encoded.length / 2);
+  const parts = [encoded.slice(0, mid), encoded.slice(mid)];
+
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const part of parts) {
+        controller.enqueue(part);
+      }
+      controller.close();
+    },
+  });
+
+  return {
+    ok: true,
+    body: stream,
+  };
+}
+
+function createSseMockWithNullChunks(contentChunks) {
+  // contentChunks includes null entries to simulate delta.content === null.
+  const sseLines = contentChunks.map((chunk) => {
+    if (chunk === null) {
+      return 'data: {"id":"1","choices":[{"delta":{"content":null},"index":0}]}';
+    }
+    return createSseChunk(chunk);
+  });
+
+  const sseData = sseLines.join('\n\n') + '\n\ndata: [DONE]\n';
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseData));
+      controller.close();
+    },
+  });
+
+  return {
+    ok: true,
+    body: stream,
+  };
+}
+
+function createSseMockWithRawContent(rawValue) {
+  // rawValue can be a number, object, array, etc. — not just strings.
+  const sseData =
+    'data: {"id":"1","choices":[{"delta":{"content":' +
+    JSON.stringify(rawValue) +
+    '},"index":0}]}\n\ndata: [DONE]\n';
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseData));
+      controller.close();
+    },
+  });
+  return { ok: true, body: stream };
+}
+
+// --- Tests ---
+
 describe('API Client', () => {
   let originalFetch;
 
@@ -106,13 +199,8 @@ describe('API Client', () => {
   });
 
   describe('translateText', () => {
-    it('sends text to LLM for translation', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: 'Hola mundo' } }],
-        }),
-      });
+    it('sends text to LLM for translation with SSE streaming', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['Hola', ' mundo']));
 
       await translateText('http://localhost:11434', 'gpt-4o', 'Hello world', 'es', 'en');
 
@@ -124,17 +212,12 @@ describe('API Client', () => {
       expect(body.messages[0].role).toBe('user');
       expect(body.messages[0].content).toContain('Translate the following text from en to es');
       expect(body.messages[0].content).toContain('Text: Hello world');
-      expect(body.stream).toBe(false);
+      expect(body.stream).toBe(true);
       expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
     });
 
-    it('returns translated string', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: 'Bonjour le monde' } }],
-        }),
-      });
+    it('returns translated string from accumulated SSE chunks', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['Bonjour', ' le', ' monde']));
 
       const result = await translateText(
         'http://localhost:11434',
@@ -160,10 +243,87 @@ describe('API Client', () => {
     });
 
     it('throws on invalid response format', async () => {
+      const emptyStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n'));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ choices: [] }),
+        body: emptyStream,
       });
+
+      await expect(
+        translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
+      ).rejects.toThrow('Invalid response format');
+    });
+
+    // --- SSE-specific tests ---
+
+    it('accumulates content across split SSE chunks', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockResponseSplit(['Split', ' ', 'Test']));
+
+      const result = await translateText(
+        'http://localhost:11434',
+        'gpt-4o',
+        'Split Test',
+        'en',
+        'en'
+      );
+
+      expect(result).toBe('Split Test');
+    });
+
+    it('skips null delta.content chunks in SSE stream', async () => {
+      global.fetch.mockResolvedValueOnce(
+        createSseMockWithNullChunks(['Hello', null, ' ', null, 'World'])
+      );
+
+      const result = await translateText(
+        'http://localhost:11434',
+        'gpt-4o',
+        'Greeting',
+        'en',
+        'en'
+      );
+
+      expect(result).toBe('Hello World');
+    });
+
+    it('throws on non-OK SSE response without attempting to parse stream', async () => {
+      global.fetch.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        statusText: 'Server Error',
+        body: null,
+      });
+
+      await expect(
+        translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
+      ).rejects.toThrow('Translation failed: 500 Server Error');
+    });
+  });
+
+  describe('parseSseLine type validation', () => {
+    it('skips numeric delta.content in SSE stream', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockWithRawContent(42));
+
+      await expect(
+        translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
+      ).rejects.toThrow('Invalid response format');
+    });
+
+    it('skips object delta.content in SSE stream', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockWithRawContent({ foo: 'bar' }));
+
+      await expect(
+        translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
+      ).rejects.toThrow('Invalid response format');
+    });
+
+    it('skips array delta.content in SSE stream', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockWithRawContent([1, 2]));
 
       await expect(
         translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
@@ -171,14 +331,34 @@ describe('API Client', () => {
     });
   });
 
-  describe('translateHtml', () => {
-    it('sends HTML content to LLM for translation', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '<p>이것은 <a>링크</a>입니다.</p>' } }],
-        }),
+  describe('readSseStream size cap', () => {
+    it('throws when SSE content exceeds size limit', async () => {
+      const bigContent = 'x'.repeat(1_100_000); // > 1 MB
+      const sseData =
+        'data: {"id":"1","choices":[{"delta":{"content":' +
+        JSON.stringify(bigContent) +
+        '},"index":0}]}\n\ndata: [DONE]\n';
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sseData));
+          controller.close();
+        },
       });
+
+      global.fetch.mockResolvedValueOnce({ ok: true, body: stream });
+
+      await expect(
+        translateText('http://localhost:11434', 'gpt-4o', 'Hello', 'es', 'en')
+      ).rejects.toThrow('SSE response exceeded size limit');
+    });
+  });
+
+  describe('translateHtml', () => {
+    it('sends HTML content to LLM for translation with SSE streaming', async () => {
+      global.fetch.mockResolvedValueOnce(
+        createSseMockResponse(['<p>', '이것은', ' <a>링크</a>', '입니다.', '</p>'])
+      );
 
       await translateHtml(
         'http://localhost:11434',
@@ -196,17 +376,14 @@ describe('API Client', () => {
       expect(body.messages[0].role).toBe('user');
       expect(body.messages[0].content).toContain('Translate the text content');
       expect(body.messages[0].content).toContain('<p>This is a <a>link</a>.</p>');
-      expect(body.stream).toBe(false);
+      expect(body.stream).toBe(true);
       expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
     });
 
-    it('returns translated HTML', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '<p>이것은 <a>링크</a>입니다.</p>' } }],
-        }),
-      });
+    it('returns translated HTML from accumulated SSE chunks', async () => {
+      global.fetch.mockResolvedValueOnce(
+        createSseMockResponse(['<p>', '이것은', ' <a>링크</a>', '입니다.', '</p>'])
+      );
 
       const result = await translateHtml(
         'http://localhost:11434',
@@ -232,9 +409,15 @@ describe('API Client', () => {
     });
 
     it('throws on invalid response format', async () => {
+      const emptyStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n'));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ choices: [] }),
+        body: emptyStream,
       });
 
       await expect(
@@ -244,13 +427,10 @@ describe('API Client', () => {
   });
 
   describe('translateTextBatch', () => {
-    it('sends multiple texts in one API call', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '["Hola mundo", "Buenos días", "Adiós"]' } }],
-        }),
-      });
+    it('sends multiple texts in one API call with SSE streaming', async () => {
+      global.fetch.mockResolvedValueOnce(
+        createSseMockResponse(['["Hola mundo", "Buenos días", "Adiós"]'])
+      );
 
       await translateTextBatch(
         'http://localhost:11434',
@@ -268,16 +448,11 @@ describe('API Client', () => {
       expect(body.messages[0].content).toContain('0: Hello world');
       expect(body.messages[0].content).toContain('1: Good morning');
       expect(body.messages[0].content).toContain('2: Goodbye');
-      expect(body.stream).toBe(false);
+      expect(body.stream).toBe(true);
     });
 
-    it('returns an array of translations', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '["Привет мир", "Доброе утро"]' } }],
-        }),
-      });
+    it('returns an array of translations from SSE stream', async () => {
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['["Привет мир", "Доброе утро"]']));
 
       const result = await translateTextBatch(
         'http://localhost:11434',
@@ -291,12 +466,7 @@ describe('API Client', () => {
     });
 
     it('uses "into Y" phrasing when sourceLang is omitted', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '["翻訳1", "翻訳2", "翻訳3"]' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['["翻訳1", "翻訳2", "翻訳3"]']));
 
       await translateTextBatch(
         'http://localhost:11434',
@@ -324,12 +494,7 @@ describe('API Client', () => {
     });
 
     it('throws on malformed JSON response from LLM', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: 'not valid json' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['not valid json']));
 
       await expect(
         translateTextBatch('http://localhost:11434', 'gpt-4o', ['text1', 'text2'], 'es', 'en')
@@ -337,12 +502,7 @@ describe('API Client', () => {
     });
 
     it('pads short response arrays with null for missing items', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '["only one"]' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['["only one"]']));
 
       const result = await translateTextBatch(
         'http://localhost:11434',
@@ -356,12 +516,9 @@ describe('API Client', () => {
     });
 
     it('trims excess items when LLM returns more than requested', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '["one", "two", "three", "four"]' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(
+        createSseMockResponse(['["one", "two", "three", "four"]'])
+      );
 
       const result = await translateTextBatch(
         'http://localhost:11434',
@@ -375,12 +532,9 @@ describe('API Client', () => {
     });
 
     it('strips markdown code fences from JSON response', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '```json\n["Hola", "Mundo"]\n```' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(
+        createSseMockResponse(['```json\n["Hola", "Mundo"]\n```'])
+      );
 
       const result = await translateTextBatch(
         'http://localhost:11434',
@@ -394,12 +548,7 @@ describe('API Client', () => {
     });
 
     it('strips plain code fences (without json label)', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          choices: [{ message: { content: '```["Hola", "Mundo"]```' } }],
-        }),
-      });
+      global.fetch.mockResolvedValueOnce(createSseMockResponse(['```["Hola", "Mundo"]```']));
 
       const result = await translateTextBatch(
         'http://localhost:11434',
@@ -413,9 +562,15 @@ describe('API Client', () => {
     });
 
     it('throws on invalid response format', async () => {
+      const emptyStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n'));
+          controller.close();
+        },
+      });
       global.fetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ choices: [] }),
+        body: emptyStream,
       });
 
       await expect(

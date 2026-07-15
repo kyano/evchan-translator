@@ -55,6 +55,10 @@ export default [
         Blob: 'readonly',
         File: 'readonly',
         FileReader: 'readonly',
+        // Stream APIs
+        TextDecoder: 'readonly',
+        TextEncoder: 'readonly',
+        ReadableStream: 'readonly',
         // Compile-time constants (defined by esbuild/vitest)
         __EVCHAN_DEBUG__: 'writable',
       },

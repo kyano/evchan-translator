@@ -79,7 +79,7 @@ describe('Background Script', () => {
 
       expect(response).toEqual({
         apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
-        model: 'Google/Gemma-4-26B-A4B-it:Q8_0',
+        model: 'Google/Gemma-4-31B-it:Q8_0',
         targetLanguage: '한국어',
       });
     });

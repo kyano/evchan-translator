@@ -1,12 +1,12 @@
 // EVChan Translator - Content Script
 // Handles DOM traversal, text extraction, translation, and restoration
 
+import { retry } from '../lib/retry.js';
+
 const HIGHLIGHT_CLASS = 'evchan-translated';
 const FAILED_CLASS = 'evchan-failed';
 const HIGHLIGHT_COLOR = '#fff59d';
 const HIGHLIGHT_DURATION = 3000; // ms
-const MESSAGE_RETRY_DELAY = 200; // ms base delay for message retries
-const MAX_MESSAGE_RETRIES = 3; // max retry attempts for background messages
 const BATCH_CHAR_LIMIT = 1_000; // target character count per batch
 const MAX_BATCH_ITEMS = 20; // safety cap on items per batch
 const KEEPALIVE_INTERVAL_MS = 10_000; // ping background every 10s to prevent MV3 service worker termination
@@ -46,33 +46,24 @@ const originalContentMap = new Map();
 const translatedElements = new Set();
 
 /**
- * Send a message to the background with retries and exponential backoff.
+ * Send a message to the background with retries.
  * MV3 service workers can be terminated when idle, causing sendMessage
- * to return null or throw. We retry up to MAX_MESSAGE_RETRIES times
- * with increasing delays (200ms, 400ms, 600ms) to handle cold-starts.
+ * to return null or throw. We retry to handle cold-starts.
  */
 async function sendMessageWithRetry(message) {
-  let lastError;
-
-  for (let attempt = 0; attempt <= MAX_MESSAGE_RETRIES; attempt++) {
-    try {
+  return retry(
+    async () => {
       const response = await chrome.runtime.sendMessage(message);
-      if (response !== null) {
-        return response;
+      if (response === null) {
+        throw new Error('Background service unavailable');
       }
-      // null response — service worker terminated; will retry
-      lastError = 'Background service unavailable';
-    } catch (error) {
-      lastError = error.message || String(error);
+      return response;
+    },
+    {
+      maxRetries: 3,
+      backoff: { base: 200, max: 1000 },
     }
-
-    // Wait with exponential backoff before retry (skip after last attempt)
-    if (attempt < MAX_MESSAGE_RETRIES) {
-      await new Promise((r) => setTimeout(r, MESSAGE_RETRY_DELAY * (attempt + 1)));
-    }
-  }
-
-  throw new Error(lastError);
+  );
 }
 
 /** @returns {{ isTranslating: boolean, shouldCancel: boolean }} */

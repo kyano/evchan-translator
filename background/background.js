@@ -2,7 +2,7 @@
 // Manages content script injection and translation request routing
 
 import { translateText, translateTextBatch, translateHtml } from '../lib/api.js';
-import { retryAsync } from '../lib/retry.js';
+import { retry } from '../lib/retry.js';
 
 const DEFAULT_SETTINGS = {
   apiEndpoint: 'https://iu-llama-cpp.linecorp.com/',
@@ -47,7 +47,10 @@ async function saveSettings(settings) {
  */
 async function sendMessageToContent(tabId, message) {
   try {
-    return await retryAsync(() => chrome.tabs.sendMessage(tabId, message), 3, 500);
+    return await retry(() => chrome.tabs.sendMessage(tabId, message), {
+      maxRetries: 3,
+      backoff: { base: 300, max: 2000 },
+    });
   } catch {
     return null;
   }

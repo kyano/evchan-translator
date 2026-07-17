@@ -76,6 +76,31 @@ Translates only the scope of the user's text selection.
 - Selection is inside a skipped element (e.g., `<textarea>`, `<code>`): treated as no selection — nothing to translate.
 - No selection or collapsed selection: popup hides the "Translate Selection" button.
 
+## Retry and Resilience
+
+A unified `retry(fn, options)` utility in `lib/retry.js` provides retry logic with exponential backoff, optional jitter, configurable retry predicates, and `AbortSignal` support. Each domain (LLM API, Chrome messaging) uses the same primitive with domain-specific `shouldRetry` predicates.
+
+### LLM API Retry
+
+All LLM API calls (`translateText`, `translateTextBatch`, `translateHtml`, `fetchModels`) are wrapped with retry:
+
+- **Retries on:** 5xx server errors, network errors (fetch throws)
+- **Never retries on:** 4xx client errors (bad request, auth failure), `AbortError`
+- **Config:** `maxRetries: 2`, `backoff: { base: 500, max: 10000 }` (exponential with jitter)
+- **Abort:** Respects the per-tab `AbortController` signal; user cancel or timeout immediately stops retries
+
+### Chrome Messaging Retry
+
+Messages between content script and background script use retry to handle MV3 service worker cold starts:
+
+- **Retries on:** Null responses (service worker terminated), connection errors
+- **Config:** `maxRetries: 3`, `backoff: { base: 200, max: 1000 }` (shorter delays for quick recovery)
+- **Background → Content:** `maxRetries: 3`, `backoff: { base: 300, max: 2000 }`
+
+### Design Principle
+
+One retry primitive, caller-defined policy. The shared utility handles the mechanics (loop, backoff, abort); each caller provides a `shouldRetry(error, attempt)` predicate encoding its failure semantics. This prevents duplicated retry logic and ensures consistent behavior across the extension.
+
 ## Prompts
 
 All prompts optionally begin with a `Page Context` line to help the LLM understand the page. The value is `document.title` (trimmed, HTML-entity-escaped, max 200 chars), falling back to the page URL (scheme + host only) when the title is empty. This line is omitted if neither is available. Page Context is placed **after** system instructions to reduce indirect prompt injection risk.

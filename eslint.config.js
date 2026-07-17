@@ -25,6 +25,7 @@ export default [
         clearInterval: 'readonly',
         AbortController: 'readonly',
         AbortSignal: 'readonly',
+        DOMException: 'readonly',
         NodeFilter: 'readonly',
         Node: 'readonly',
         MutationObserver: 'readonly',

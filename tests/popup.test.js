@@ -174,7 +174,7 @@ describe('Popup', () => {
     });
 
     it('shows error message when model fetch fails', async () => {
-      fetchMock.mockResolvedValueOnce({
+      fetchMock.mockResolvedValue({
         ok: false,
         status: 500,
         statusText: 'Internal Server Error',
@@ -184,7 +184,7 @@ describe('Popup', () => {
       input.value = 'http://test.com';
       input.dispatchEvent(new Event('change'));
 
-      await flush(50);
+      await flush(2000); // Account for retry backoff delays
 
       const modelSelect = document.getElementById('model');
       expect(modelSelect.options[0].text).toBe('Network error');

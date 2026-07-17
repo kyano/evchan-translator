@@ -149,7 +149,7 @@ describe('API Client', () => {
     });
 
     it('throws on network failure', async () => {
-      global.fetch.mockResolvedValueOnce({
+      global.fetch.mockResolvedValue({
         ok: false,
         status: 500,
         statusText: 'Internal Server Error',
@@ -292,7 +292,7 @@ describe('API Client', () => {
     });
 
     it('throws on non-OK SSE response without attempting to parse stream', async () => {
-      global.fetch.mockResolvedValueOnce({
+      global.fetch.mockResolvedValue({
         ok: false,
         status: 500,
         statusText: 'Server Error',
@@ -482,7 +482,7 @@ describe('API Client', () => {
     });
 
     it('throws on API failure', async () => {
-      global.fetch.mockResolvedValueOnce({
+      global.fetch.mockResolvedValue({
         ok: false,
         status: 500,
         statusText: 'Internal Server Error',

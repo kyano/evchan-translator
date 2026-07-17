@@ -356,7 +356,7 @@ describe('Background Script', () => {
     });
 
     it('returns error when API fails', async () => {
-      global.fetch.mockResolvedValueOnce({
+      global.fetch.mockResolvedValue({
         ok: false,
         status: 500,
         statusText: 'Internal Server Error',

@@ -73,7 +73,7 @@ export default [
     },
   },
   {
-    ignores: ['node_modules/', 'dist/', '*.min.js', 'eslint.config.js'],
+    ignores: ['node_modules/', 'dist/', 'EVChan Translator', '*.min.js', 'eslint.config.js'],
   },
   // Test files: add vitest globals and Node.js `global` object
   {
